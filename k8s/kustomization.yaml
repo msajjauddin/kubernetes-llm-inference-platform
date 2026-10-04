@@ -1,0 +1,6 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Later layers append here: vllm/, litellm/, network/, rbac/, autoscaler/, observability/
+resources:
+  - namespaces.yaml

@@ -1,0 +1,13 @@
+# Chart: nvidia.github.io/k8s-device-plugin nvidia-device-plugin
+# The chart's default node affinity already matches nodes labelled nvidia.com/gpu.present=true
+# (set on the GPU node group in terraform/main.tf), and its default tolerations cover the
+# nvidia.com/gpu:NoSchedule taint, so it only runs on GPU nodes.
+
+# Defaults: one GPU = one schedulable nvidia.com/gpu (no time-slicing/MIG; out of scope for v1).
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 256Mi

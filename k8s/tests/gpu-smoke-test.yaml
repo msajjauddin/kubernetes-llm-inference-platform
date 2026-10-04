@@ -1,0 +1,32 @@
+# One-shot check that a GPU node can run CUDA: schedules on a GPU node, prints nvidia-smi, exits.
+#   kubectl apply -f k8s/tests/gpu-smoke-test.yaml
+#   kubectl -n gpu-test logs job/gpu-smoke-test
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gpu-test
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gpu-smoke-test
+  namespace: gpu-test
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        workload: gpu-inference
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: cuda
+          image: nvcr.io/nvidia/cuda:12.6.3-base-ubuntu24.04
+          command: ["nvidia-smi"]
+          resources:
+            limits:
+              nvidia.com/gpu: 1

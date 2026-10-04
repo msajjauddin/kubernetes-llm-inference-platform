@@ -1,0 +1,16 @@
+region       = "us-east-1"
+cluster_name = "llm-inference"
+environment  = "dev"
+
+# Lock the API endpoint down to your own IP/VPN.
+cluster_endpoint_public_access_cidrs = ["203.0.113.10/32"]
+
+# GPU fleet: 1 warm node, up to 6 under load. Set gpu_min_size = 0 to pay nothing for GPUs when idle
+# (first request after idle then waits for a node to boot plus the model to load).
+gpu_instance_types = ["g5.xlarge", "g6.xlarge"]
+gpu_min_size       = 1
+gpu_max_size       = 6
+gpu_capacity_type  = "ON_DEMAND"
+
+# Production: one NAT gateway per AZ.
+single_nat_gateway = true
