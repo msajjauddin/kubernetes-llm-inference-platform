@@ -1,0 +1,30 @@
+{{- if .Values.metrics.serviceMonitor.enabled }}
+# LiteLLM's Prometheus callback serves /metrics on the API port: requests, failures, latency,
+# time to first token, tokens and spend per key/team/model.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "litellm.fullname" . }}
+  labels:
+    {{- include "litellm.labels" . | nindent 4 }}
+    {{- with .Values.metrics.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "litellm.gatewaySelectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: http
+      # /metrics redirects to /metrics/.
+      path: /metrics/
+      interval: {{ .Values.metrics.serviceMonitor.interval }}
+      {{- if .Values.metrics.requireAuth }}
+      # Virtual key limited to /metrics (metrics-key-job.yaml). The Secret is in this namespace.
+      authorization:
+        type: Bearer
+        credentials:
+          name: {{ .Values.existingSecret }}
+          key: LITELLM_METRICS_TOKEN
+      {{- end }}
+{{- end }}

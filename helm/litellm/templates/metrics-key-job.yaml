@@ -1,0 +1,82 @@
+{{- if .Values.metrics.requireAuth }}
+{{- if not (include "litellm.hasDatabase" .) }}
+{{- fail "metrics.requireAuth needs a database for the scrape key: enable postgres, set externalDatabase.existingSecret, or set metrics.requireAuth=false" }}
+{{- end }}
+{{- $svc := printf "http://%s:%v" (include "litellm.fullname" .) .Values.service.port }}
+# Registers LITELLM_METRICS_TOKEN as a virtual key limited to /metrics, once the gateway is up.
+# Idempotent; a new Job per release revision, so changing the token in the Secret and running
+# helm upgrade registers the new one.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "litellm.fullname" . }}-metrics-key-{{ .Release.Revision }}
+  labels:
+    {{- include "litellm.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: metrics-key-job
+    {{- include "litellm.commonLabels" . | nindent 4 }}
+spec:
+  backoffLimit: 6
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        {{- include "litellm.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: metrics-key-job
+    spec:
+      restartPolicy: OnFailure
+      automountServiceAccountToken: false
+      nodeSelector:
+        {{- toYaml .Values.nodeSelector | nindent 8 }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 100
+        runAsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: register
+          image: "{{ .Values.metrics.scrapeKeyJob.image.repository }}:{{ .Values.metrics.scrapeKeyJob.image.tag }}"
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: GATEWAY
+              value: {{ $svc }}
+            - name: LITELLM_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecret }}
+                  key: LITELLM_MASTER_KEY
+            - name: LITELLM_METRICS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecret }}
+                  key: LITELLM_METRICS_TOKEN
+          command:
+            - sh
+            - -ec
+            - |
+              until curl -sf "$GATEWAY/health/readiness" >/dev/null; do echo "waiting for gateway"; sleep 5; done
+              auth="Authorization: Bearer $LITELLM_MASTER_KEY"
+              code=$(curl -s -o /dev/null -w '%{http_code}' -G "$GATEWAY/key/info" --data-urlencode "key=$LITELLM_METRICS_TOKEN" -H "$auth")
+              if [ "$code" = 200 ]; then echo "scrape key already registered"; exit 0; fi
+              # The token was rotated: drop the old scrape key (aliases are unique), then add the new one.
+              curl -s -o /dev/null "$GATEWAY/key/delete" -H "$auth" -H 'Content-Type: application/json' \
+                -d '{"key_aliases": ["prometheus-scrape"]}' || true
+              curl -sf "$GATEWAY/key/generate" -H "$auth" -H 'Content-Type: application/json' \
+                -d "{\"key\": \"$LITELLM_METRICS_TOKEN\", \"key_alias\": \"prometheus-scrape\", \"allowed_routes\": [\"/metrics\"], \"models\": [\"no-models\"], \"metadata\": {\"purpose\": \"Prometheus scrape of /metrics\"}}" >/dev/null
+              echo "scrape key registered"
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+{{- end }}

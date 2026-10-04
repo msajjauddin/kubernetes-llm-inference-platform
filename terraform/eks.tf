@@ -24,6 +24,10 @@ module "eks" {
   addons = {
     vpc-cni = {
       before_compute = true
+      # Enforce Kubernetes NetworkPolicies (k8s/network, helm/litellm) with the CNI's eBPF agent.
+      configuration_values = jsonencode({
+        enableNetworkPolicy = "true"
+      })
     }
     eks-pod-identity-agent = {
       before_compute = true

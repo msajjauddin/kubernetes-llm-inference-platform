@@ -1,0 +1,203 @@
+# LiteLLM Proxy: the only API clients talk to. Auth (master key + virtual keys), routing, retries,
+# rate limits and spend tracking in front of vLLM, on the CPU "system" nodes.
+#   scripts/create-litellm-secrets.sh            # once: master key, salt key, DB + Redis passwords
+#   helm upgrade --install litellm helm/litellm -n llm
+
+image:
+  # The non-root build (UID 65534) passes Pod Security "restricted" and bundles Prisma for the DB.
+  repository: ghcr.io/berriai/litellm-non_root
+  tag: v1.104.0
+  pullPolicy: IfNotPresent
+
+# Secret holding LITELLM_MASTER_KEY, LITELLM_SALT_KEY, LITELLM_METRICS_TOKEN and, when the bundled
+# stores are on, POSTGRES_PASSWORD and REDIS_PASSWORD. Never in Git (SEC-5): create it with
+# scripts/create-litellm-secrets.sh, or sync it from AWS Secrets Manager with External Secrets.
+# Shape: k8s/litellm/secret.example.yaml
+existingSecret: litellm-secrets
+
+# Plain LiteLLM config.yaml (https://docs.litellm.ai/docs/proxy/configs). The chart adds
+# general_settings.master_key, database_url and router_settings.redis_* from the Secret, so leave
+# those out here.
+config:
+  model_list:
+    # FR-3: entries sharing a model_name are load-balanced; add a second vLLM release (another
+    # model, region or instance type) under the same name and the router spreads and fails over.
+    - model_name: qwen2.5-7b-instruct
+      litellm_params:
+        model: hosted_vllm/qwen2.5-7b-instruct
+        api_base: http://vllm.llm.svc:8000/v1
+        # vLLM's queue absorbs bursts; the router waits instead of failing fast.
+        timeout: 600
+        stream_timeout: 120
+      model_info:
+        # GPU cost allocated per token so spend metrics and key budgets mean something (FR-6, FR-16).
+        # ~$1.006/h g5.xlarge on demand / (3600 s * ~600 output tok/s per GPU, NFR-2).
+        # Prefill is far cheaper per token than decode.
+        input_cost_per_token: 0.00000005
+        output_cost_per_token: 0.00000047
+        max_input_tokens: 8192   # vLLM --max-model-len
+        max_output_tokens: 4096
+
+  router_settings:
+    routing_strategy: simple-shuffle
+    num_retries: 2
+    # A deployment that fails allowed_fails times in a minute is skipped for cooldown_time seconds.
+    allowed_fails: 3
+    cooldown_time: 30
+    timeout: 600
+    # Cross-model failover, e.g. [{"qwen2.5-7b-instruct": ["qwen2.5-7b-instruct-fp8"]}]
+    fallbacks: []
+    # Requests that exceed the context window go to a bigger-context model, if you have one.
+    context_window_fallbacks: []
+
+  litellm_settings:
+    # FR-6: request counts, latency, TTFT, tokens and spend on /metrics (port 4000, no auth).
+    callbacks: ["prometheus"]
+    request_timeout: 600
+    # Silently drop OpenAI params vLLM doesn't support instead of failing the request.
+    drop_params: true
+    # Prompts and completions stay out of spend logs and callbacks.
+    turn_off_message_logging: true
+    # FR-5: what /key/generate hands out when the caller doesn't say, and the most it may ask for.
+    default_key_generate_params:
+      rpm_limit: 60
+      tpm_limit: 100000
+      max_parallel_requests: 16
+      max_budget: 50
+      budget_duration: 30d
+    upperbound_key_generate_params:
+      rpm_limit: 1000
+      tpm_limit: 2000000
+      max_parallel_requests: 64
+      max_budget: 1000
+      budget_duration: 30d
+      duration: 365d
+
+  general_settings:
+    # FR-4 at this layer: auth, per-key allowed models (403), unknown models (400), key limits
+    # capped by upperbound_key_generate_params, and vLLM rejects prompts over --max-model-len.
+    # (max_request_size_mb is LiteLLM Enterprise only; cap body size on the ALB/WAF instead.)
+    # Per gateway replica. With 2+ replicas keep this above vLLM's total batch capacity.
+    global_max_parallel_requests: 512
+    # Spend is buffered in Redis and written to Postgres in batches, not once per request.
+    use_redis_transaction_buffer: true
+    proxy_batch_write_at: 30
+    # Models live in this file (GitOps), not in the DB through the admin UI.
+    store_model_in_db: false
+
+extraEnv: []
+
+# Bundled Postgres for virtual keys, teams, budgets and spend logs. Fine for dev and a single
+# cluster; for production set enabled: false and point externalDatabase at RDS.
+postgres:
+  enabled: true
+  image:
+    repository: postgres
+    tag: "17.11-alpine"
+  database: litellm
+  user: litellm
+  storage:
+    size: 20Gi
+    storageClassName: ""   # cluster default (gp3)
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 1Gi
+
+# Used when postgres.enabled is false: a Secret with a full postgresql:// URL.
+externalDatabase:
+  existingSecret: ""
+  key: DATABASE_URL
+
+# Bundled Redis, shared by all gateway replicas so RPM/TPM limits, parallel-request counts and
+# deployment cooldowns are cluster-wide, not per pod. No persistence: counters are short-lived.
+redis:
+  enabled: true
+  image:
+    repository: redis
+    tag: "7.4.11-alpine"
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+
+service:
+  type: ClusterIP # REQUIREMENTS §5: port-forward in dev, ALB Ingress + WAF in prod
+  port: 4000
+
+serviceAccount:
+  create: true
+  name: ""
+
+# One uvicorn worker per pod; scale with replicas. Several workers per pod would need Prometheus
+# multiprocess mode to keep /metrics correct.
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    memory: 2Gi
+
+# Contract from the cluster layer: everything that isn't GPU inference runs on the system nodes.
+nodeSelector:
+  role: system
+tolerations: []
+
+probes:
+  # The first start runs Prisma migrations against the database.
+  startup:
+    periodSeconds: 5
+    failureThreshold: 60
+  readiness:
+    periodSeconds: 10
+    failureThreshold: 3
+  liveness:
+    periodSeconds: 15
+    failureThreshold: 4
+
+terminationGracePeriodSeconds: 90
+preStopSleepSeconds: 10
+
+# NFR-4 (99.9% for the gateway): at least two replicas in different AZs, HPA on CPU (FR-11).
+replicaCount: 2
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 70
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+networkPolicy:
+  enabled: true
+  # Who may call the gateway on 4000 (SEC-2 "client -> LiteLLM"). Default: any pod in the cluster,
+  # since the gateway enforces keys. Narrow it, e.g. [{namespaceSelector: {matchLabels: {team: apps}}}]
+  # Prometheus in the observability namespace is always allowed.
+  ingressFrom:
+    - namespaceSelector: {}
+
+metrics:
+  # /metrics carries key aliases, teams and spend, so LiteLLM requires a key for it. A Job registers
+  # LITELLM_METRICS_TOKEN from the Secret as a virtual key that may call /metrics and nothing else,
+  # and the ServiceMonitor scrapes with it. Needs the database (virtual keys live there).
+  # false: /metrics is open to anyone who can reach port 4000.
+  requireAuth: true
+  scrapeKeyJob:
+    image:
+      repository: curlimages/curl
+      tag: "8.22.0"
+  # Turn on once the observability layer installs the Prometheus Operator CRDs.
+  serviceMonitor:
+    enabled: false
+    interval: 15s
+    labels: {}
+
+priorityClassName: ""
+podAnnotations: {}
+podLabels: {}

@@ -9,8 +9,8 @@ and provisioned with Terraform. Full requirements: [docs/REQUIREMENTS.md](docs/R
 |---|---|---|
 | 1. GPU cluster foundation (VPC, EKS, GPU node group, NVIDIA device plugin, Cluster Autoscaler, ECR) | **Done** | `terraform/`, `helm/`, `k8s/namespaces.yaml` |
 | 2. vLLM serving + KEDA autoscaling | **Done** (autoscaling goes live with layer 4's Prometheus) | `helm/vllm/`, `helm/keda.yaml`, `terraform/addons.tf` |
-| 3. LiteLLM gateway (keys, routing, rate limits) | Next | `k8s/litellm/`, `litellm/` |
-| 4. Observability (Prometheus, Grafana, DCGM exporter, OTel) | Planned | `helm/`, `grafana-dashboards/` |
+| 3. LiteLLM gateway (keys, routing, rate limits, NetworkPolicies) | **Done** | `helm/litellm/`, `k8s/network/`, `k8s/litellm/` |
+| 4. Observability (Prometheus, Grafana, DCGM exporter, OTel) | Next | `helm/`, `grafana-dashboards/` |
 
 ## What layer 1 creates
 
@@ -113,8 +113,8 @@ drops, KEDA waits 10 minutes and removes one replica per 5 minutes; Cluster Auto
 emptied GPU nodes, down to `gpu_min_size`.
 
 Why vLLM's queue rather than gateway request rate (REQUIREMENTS §5): request rate doesn't know how long
-requests are, while running + waiting is exactly how loaded each GPU is. Once LiteLLM is deployed, a
-request-rate trigger can be added through `autoscaling.extraTriggers` and KEDA uses whichever asks for more.
+requests are, while running + waiting is exactly how loaded each GPU is. The gateway's request rate is
+available as an extra trigger in `helm/vllm/values-litellm-trigger.yaml`; KEDA uses whichever asks for more.
 
 **Until Prometheus exists (layer 4)** KEDA can't read the metrics, so it holds vLLM at its current
 replica count (fallback `currentReplicasIfHigher`, never below 1). Nothing breaks; it just doesn't scale.
@@ -154,17 +154,106 @@ kubectl -n llm get scaledobject,hpa vllm
 - **Resources** (`2500m` CPU, `10Gi`/`14Gi` memory) fit g5/g6.xlarge next to the node DaemonSets. A pod
   that requests more than the node type offers is never scheduled and Cluster Autoscaler won't add a
   node for it, so revisit these if `gpu_instance_types` changes.
-- **No NetworkPolicy yet**: the Service is ClusterIP only; the default-deny and LiteLLM -> vLLM allowlist
-  (SEC-1/2) come with the gateway layer.
+- **NetworkPolicy**: only LiteLLM and the `observability` namespace can reach vLLM (`k8s/network/`, layer 3).
 
-## Offline checks for the chart
+## LiteLLM gateway (layer 3)
+
+```
+namespace llm  (default-deny ingress, k8s/network/network-policies.yaml)
+├── Deployment litellm         ghcr.io/berriai/litellm-non_root:v1.104.0, 2..6 replicas (HPA on CPU), system nodes
+│     spread over AZs, PDB minAvailable 1, runs as UID 65534 (PSS restricted)
+├── Service litellm            ClusterIP :4000   OpenAI API /v1, admin API /key/*, /metrics/, /health/*
+├── StatefulSet litellm-postgres  Postgres 17, 20Gi gp3: virtual keys, teams, budgets, spend logs
+├── Deployment litellm-redis   Redis 7.4, in-memory: cross-replica rate-limit counters, cooldowns, spend buffer
+├── Job litellm-metrics-key-N  registers the Prometheus scrape key (one per helm revision)
+└── vllm (layer 2)             reachable only from litellm pods and the observability namespace
+```
+
+Requests flow client -> `litellm:4000` -> `vllm:8000`. Clients never see vLLM.
+
+| Requirement | How |
+|---|---|
+| FR-2 auth | Master key (admin only) plus virtual keys from `/key/generate`, stored in Postgres. No key: 401. |
+| FR-3 routing | `model_list` entries with the same `model_name` are load-balanced (`simple-shuffle`); 2 retries, a deployment failing 3 times a minute is cooled down for 30 s; `fallbacks` / `context_window_fallbacks` for cross-model failover. Add a second vLLM release under the same name to spread load across both. |
+| FR-4 validation | Per-key model allowlist (403), unknown model (400), key limits capped by `upperbound_key_generate_params`, vLLM rejects prompts over `max-model-len`. |
+| FR-5 rate limits | Per key `rpm_limit` / `tpm_limit` / `max_parallel_requests` (429 when exceeded), defaults and ceilings in `values.yaml`; `global_max_parallel_requests` per replica. Counters live in Redis, so limits hold across replicas. |
+| FR-6 telemetry | Prometheus callback on `/metrics/`: `litellm_proxy_total_requests_metric_total`, `litellm_proxy_failed_requests_metric_total`, `litellm_request_total_latency_metric`, `litellm_llm_api_time_to_first_token_metric`, token counters, `litellm_spend_metric_total`, per key/team/model. |
+| FR-16 spend | `model_info` prices tokens from the GPU's hourly cost (~$1/h at ~600 tok/s), so budgets and spend per key mean something. Adjust if your instance type or throughput differs. |
+| SEC-1/2/7 | Default-deny ingress in `llm`; allow any pod -> LiteLLM :4000, LiteLLM -> vLLM :8000 / Postgres / Redis, observability -> metrics. Enforced by the VPC CNI (`enableNetworkPolicy`, `terraform/eks.tf`). |
+| SEC-5 | Keys live in the `litellm-secrets` Secret, created by a script, never in Git. |
+
+### Deploy
 
 ```bash
-helm lint helm/vllm
-helm template vllm helm/vllm -n llm --kube-version 1.33.0 | kubeconform -strict -summary \
-  -schema-location default \
-  -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+cd terraform && terraform apply                 # turns on NetworkPolicy enforcement in the vpc-cni add-on
+cd ..
+kubectl apply -k k8s/                           # namespaces + default-deny + vLLM allowlist
+scripts/create-litellm-secrets.sh               # random master/salt/scrape keys and DB/Redis passwords
+helm upgrade --install litellm helm/litellm -n llm
+kubectl -n llm rollout status deploy/litellm    # first start runs the DB migrations (~30 s)
 ```
+
+Apply `k8s/` and install the gateway together: once default-deny is in, vLLM only takes traffic from
+LiteLLM pods.
+
+### Use it
+
+```bash
+kubectl -n llm port-forward svc/litellm 4000:4000 &
+MASTER=$(kubectl -n llm get secret litellm-secrets -o jsonpath='{.data.LITELLM_MASTER_KEY}' | base64 -d)
+
+# A key per team or app, with its own limits and budget
+curl -s localhost:4000/key/generate -H "Authorization: Bearer $MASTER" -H 'Content-Type: application/json' \
+  -d '{"key_alias": "team-a", "models": ["qwen2.5-7b-instruct"], "rpm_limit": 120, "tpm_limit": 200000, "max_budget": 20}'
+
+# Any OpenAI SDK works: base_url=http://localhost:4000/v1, api_key=<that key>
+curl -s localhost:4000/v1/chat/completions -H "Authorization: Bearer sk-..." -H 'Content-Type: application/json' \
+  -d '{"model": "qwen2.5-7b-instruct", "messages": [{"role": "user", "content": "Hello"}]}'
+```
+
+The admin UI is at `http://localhost:4000/ui` (log in with the master key). Production exposure is an
+ALB Ingress with WAF in front of the `litellm` Service (REQUIREMENTS §5); cap request body size there.
+
+### Verify
+
+```bash
+scripts/verify-litellm.sh    # health, chat via gateway, 401 without key, 403 wrong model, 429 over rpm,
+                             # /metrics needs the scrape token, vLLM unreachable from other pods (AC-1, AC-7)
+```
+
+### Choices
+
+- **Postgres in the chart** keeps the stack self-contained. It's one pod on one EBS volume: fine for dev
+  and a single cluster, but losing it loses virtual keys. For production use RDS:
+  `--set postgres.enabled=false --set externalDatabase.existingSecret=<secret with DATABASE_URL>`.
+- **Redis in the chart, no persistence.** Without a shared Redis each replica counts rate limits on its
+  own, so a 60 RPM key would really get 60 x replicas. Losing Redis only resets short-lived counters.
+  ElastiCache works the same way through `extraEnv` / `config`.
+- **`/metrics` needs a key.** LiteLLM's metrics carry key aliases, teams and spend, and port 4000 is open
+  to the whole cluster. The chart registers `LITELLM_METRICS_TOKEN` as a virtual key allowed only
+  `/metrics`, and the ServiceMonitor scrapes with it. `metrics.requireAuth=false` opens it instead.
+- **One worker per pod**, scaled by replicas: multiple uvicorn workers would need Prometheus
+  multiprocess mode to keep `/metrics` correct.
+- **Gateway HPA on CPU** (FR-11): the gateway itself is light; GPU capacity follows vLLM's queue via KEDA.
+- **Request size limits** (`max_request_size_mb`) are LiteLLM Enterprise only, so they belong on the ALB/WAF.
+- **Models in the config file** (`store_model_in_db: false`): model routing changes go through Git and
+  `helm upgrade`, not the admin UI.
+
+## Offline checks for the charts
+
+```bash
+helm lint helm/vllm helm/litellm
+for c in vllm litellm; do
+  helm template $c helm/$c -n llm --kube-version 1.33.0 --set metrics.serviceMonitor.enabled=true | kubeconform -strict -summary \
+    -schema-location default \
+    -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+done
+kubeconform -strict -summary k8s/namespaces.yaml k8s/network/
+```
+
+The LiteLLM config was also run for real (LiteLLM 1.104.0 with local Postgres and Redis and a stub
+OpenAI server in place of vLLM) to check auth, routing, streaming, per-key 429s, the scrape key and
+`/metrics`; `scripts/verify-litellm.sh` passed against it.
 
 ## Contract for later layers
 
@@ -184,7 +273,14 @@ resources:
 
 Everything else should use `nodeSelector: {role: system}`.
 
-vLLM's in-cluster endpoint for LiteLLM is `http://vllm.llm.svc:8000/v1`, model `qwen2.5-7b-instruct`. `terraform output` exposes
+vLLM's in-cluster endpoint for LiteLLM is `http://vllm.llm.svc:8000/v1`, model `qwen2.5-7b-instruct`.
+Clients use the gateway at `http://litellm.llm.svc:4000/v1`.
+
+For the observability layer: run Prometheus in the `observability` namespace (the NetworkPolicies already
+let it scrape `llm`), then `helm upgrade litellm helm/litellm -n llm --reuse-values --set metrics.serviceMonitor.enabled=true`
+(and the same for vllm). LiteLLM's ServiceMonitor scrapes `/metrics/` with the `LITELLM_METRICS_TOKEN`
+bearer token from `litellm-secrets`. Optionally add `helm/vllm/values-litellm-trigger.yaml` for the
+request-rate KEDA trigger. `terraform output` exposes
 `gpu_node_selector`, `gpu_toleration`, `ecr_repository_urls`, `node_security_group_id` and the
 cluster details for scripts and CI.
 
