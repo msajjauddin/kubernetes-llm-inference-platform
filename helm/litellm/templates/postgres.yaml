@@ -61,6 +61,8 @@ spec:
         - name: postgres
           image: "{{ $p.image.repository }}:{{ $p.image.tag }}"
           imagePullPolicy: IfNotPresent
+          # Every gateway replica holds general_settings.database_connection_pool_limit connections.
+          args: ["-c", "max_connections={{ $p.maxConnections }}"]
           env:
             - name: POSTGRES_DB
               value: {{ $p.database }}

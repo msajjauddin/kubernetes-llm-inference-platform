@@ -1,0 +1,72 @@
+# Production profile: 5,000 concurrent (in-flight) requests through the gateway. docs/CAPACITY.md.
+#   helm upgrade --install litellm helm/litellm -n llm -f helm/litellm/values-5k.yaml \
+#     --set ingress.certificateArn=arn:aws:acm:...   # HTTPS on the internal ALB
+
+ingress:
+  enabled: true
+  scheme: internal
+
+# Streaming 5,000 responses means relaying ~100k tokens/s of chunks. One uvicorn worker per pod,
+# so scale on pods: ~500 concurrent streams per pod at 1 vCPU.
+resources:
+  requests:
+    cpu: "1"
+    memory: 2Gi
+  limits:
+    memory: 4Gi
+autoscaling:
+  enabled: true
+  minReplicas: 10
+  maxReplicas: 30
+  targetCPUUtilizationPercentage: 60
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 8
+
+config:
+  model_list:
+    - model_name: qwen2.5-7b-instruct
+      litellm_params:
+        model: hosted_vllm/qwen2.5-7b-instruct
+        api_base: http://vllm.llm.svc:8000/v1
+        timeout: 600
+        stream_timeout: 120
+      model_info:
+        # ~$1.86/h g6e.xlarge on demand / (3600 s * ~2,300 output tok/s per GPU, docs/CAPACITY.md).
+        input_cost_per_token: 0.00000002
+        output_cost_per_token: 0.00000022
+        max_input_tokens: 8192
+        max_output_tokens: 4096
+  general_settings:
+    # Per gateway replica: 10 replicas x 600 = 6,000, above the 5,000 target even when the ALB
+    # spreads load unevenly. Beyond it the gateway answers 429 instead of overloading vLLM.
+    global_max_parallel_requests: 600
+    # 30 replicas x 5 = 150 connections; postgres.maxConnections below leaves room for migrations.
+    database_connection_pool_limit: 5
+  litellm_settings:
+    # Platform keys (internal developer platform, other shared services) carry most of the traffic,
+    # so the ceiling an admin may grant one key is the whole fleet. Ordinary keys keep the defaults.
+    upperbound_key_generate_params:
+      rpm_limit: 60000
+      tpm_limit: 100000000
+      max_parallel_requests: 5000
+      max_budget: 100000
+      budget_duration: 30d
+      duration: 365d
+
+postgres:
+  maxConnections: 200
+  resources:
+    requests:
+      cpu: "1"
+      memory: 2Gi
+    limits:
+      memory: 4Gi
+
+redis:
+  resources:
+    requests:
+      cpu: 500m
+      memory: 256Mi
+    limits:
+      memory: 1Gi

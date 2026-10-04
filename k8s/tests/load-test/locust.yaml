@@ -1,0 +1,136 @@
+# Distributed Locust run for the 5,000-concurrent target (docs/CAPACITY.md). 1 master + 12 workers,
+# ~420 users each. Workers keep one streaming request open per user.
+#
+#   kubectl apply -f k8s/tests/load-test/locust.yaml
+#   kubectl -n load-test create configmap locustfile --from-file=scripts/locustfile.py
+#   kubectl -n load-test create secret generic llm-api-key --from-literal=key=<platform key>
+#   kubectl -n load-test port-forward svc/locust-master 8089      # UI: start 5000 users, spawn 25/s
+#
+# Default target is the gateway Service, which skips the ALB. To include it, set LOCUST_HOST
+# on the master to the ALB URL (and allow the load-test pods' CIDR in ingress.allowedCIDRs).
+# Workers need ~12 vCPU on the system nodes; scale that node group up for the test.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: load-test
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: locust-master
+  namespace: load-test
+spec:
+  selector:
+    app: locust-master
+  ports:
+    - name: ui
+      port: 8089
+    - name: workers
+      port: 5557
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: locust-master
+  namespace: load-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: locust-master
+  template:
+    metadata:
+      labels:
+        app: locust-master
+    spec:
+      nodeSelector:
+        role: system
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000 # "locust" in the image; numeric so the kubelet can verify non-root
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: locust
+          image: locustio/locust:2.46.6
+          args: ["-f", "/mnt/locust/locustfile.py", "--master", "--expect-workers", "12"]
+          env:
+            - name: LOCUST_HOST
+              value: http://litellm.llm.svc:4000
+            - name: LLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: llm-api-key
+                  key: key
+          ports:
+            - containerPort: 8089
+            - containerPort: 5557
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: locustfile
+              mountPath: /mnt/locust
+      volumes:
+        - name: locustfile
+          configMap:
+            name: locustfile
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: locust-worker
+  namespace: load-test
+spec:
+  replicas: 12
+  selector:
+    matchLabels:
+      app: locust-worker
+  template:
+    metadata:
+      labels:
+        app: locust-worker
+    spec:
+      nodeSelector:
+        role: system
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000 # "locust" in the image; numeric so the kubelet can verify non-root
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: locust
+          image: locustio/locust:2.46.6
+          args: ["-f", "/mnt/locust/locustfile.py", "--worker", "--master-host", "locust-master"]
+          env:
+            - name: LLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: llm-api-key
+                  key: key
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi
+            limits:
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: locustfile
+              mountPath: /mnt/locust
+      volumes:
+        - name: locustfile
+          configMap:
+            name: locustfile

@@ -1,0 +1,31 @@
+# Production profile: 5,000 concurrent (in-flight) requests. Sizing and assumptions: docs/CAPACITY.md.
+#   cp 5k.tfvars.example terraform.tfvars   # then set region and your CIDRs
+# Pair with helm/vllm/values-5k.yaml and helm/litellm/values-5k.yaml.
+#
+# Before applying, raise the EC2 quota "Running On-Demand G and VT instances" to at least
+# gpu_max_size x 4 = 200 vCPUs in the region, and confirm g6e capacity in your AZs.
+
+region       = "us-east-1"
+cluster_name = "llm-inference"
+environment  = "prod"
+
+cluster_endpoint_public_access_cidrs = ["203.0.113.10/32"]
+
+# One NAT gateway per AZ: an AZ outage doesn't cut the others off from image and model downloads.
+single_nat_gateway = false
+
+# Gateway (10-30 LiteLLM pods at 1 vCPU), Prometheus, Grafana, KEDA, controllers.
+system_instance_types = ["m6i.2xlarge", "m7i.2xlarge"]
+system_min_size       = 3
+system_desired_size   = 3
+system_max_size       = 8
+
+# 1 x NVIDIA L40S 48 GB per node. Both types have one GPU; 2xlarge is the fallback when xlarge
+# capacity runs out.
+gpu_instance_types = ["g6e.xlarge", "g6e.2xlarge"]
+gpu_count_per_node = 1
+gpu_capacity_type  = "ON_DEMAND"
+gpu_min_size       = 2
+gpu_desired_size   = 2
+# = vLLM autoscaling.maxReplicas in values-5k.yaml (50 x 100 in flight = 5,000).
+gpu_max_size = 50

@@ -109,3 +109,43 @@ run "observability_feeds_autoscaling_and_dashboards" {
     error_message = "Expected one Grafana dashboard ConfigMap per file in grafana-dashboards/"
   }
 }
+
+run "alb_controller_for_gateway_ingress" {
+  command = plan
+
+  assert {
+    condition     = helm_release.aws_load_balancer_controller.chart == "aws-load-balancer-controller" && helm_release.aws_load_balancer_controller.namespace == "kube-system"
+    error_message = "AWS Load Balancer Controller not planned: the LiteLLM Ingress would never get an ALB"
+  }
+
+  assert {
+    condition     = strcontains(file("../helm/aws-load-balancer-controller.yaml.tftpl"), "name: aws-load-balancer-controller") && module.aws_lb_controller_pod_identity.associations["this"].service_account == "aws-load-balancer-controller"
+    error_message = "Controller service account must match its Pod Identity association"
+  }
+}
+
+run "profile_5k_concurrent" {
+  command = plan
+
+  variables {
+    gpu_instance_types    = ["g6e.xlarge", "g6e.2xlarge"]
+    gpu_min_size          = 2
+    gpu_desired_size      = 2
+    gpu_max_size          = 50
+    system_instance_types = ["m6i.2xlarge", "m7i.2xlarge"]
+    system_min_size       = 3
+    system_desired_size   = 3
+    system_max_size       = 8
+    single_nat_gateway    = false
+  }
+
+  assert {
+    condition     = module.eks.eks_managed_node_groups["gpu"] != null
+    error_message = "GPU node group missing in the 5k profile"
+  }
+
+  assert {
+    condition     = length(module.vpc.natgw_ids) == 3
+    error_message = "5k profile should plan one NAT gateway per AZ"
+  }
+}

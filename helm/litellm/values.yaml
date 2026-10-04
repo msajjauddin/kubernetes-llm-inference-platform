@@ -96,6 +96,8 @@ postgres:
     tag: "17.11-alpine"
   database: litellm
   user: litellm
+  # Keep above gateway maxReplicas x database_connection_pool_limit, plus ~20 for admin/migrations.
+  maxConnections: 100
   storage:
     size: 20Gi
     storageClassName: ""   # cluster default (gp3)
@@ -126,8 +128,30 @@ redis:
       memory: 512Mi
 
 service:
-  type: ClusterIP # REQUIREMENTS §5: port-forward in dev, ALB Ingress + WAF in prod
+  type: ClusterIP # reached through the ALB below, or kubectl port-forward in dev
   port: 4000
+
+# Application Load Balancer for apps outside the cluster (internal developer platform, other
+# services). Needs the AWS Load Balancer Controller from terraform/load_balancer.tf.
+ingress:
+  enabled: false
+  # internal: private subnets, reachable only from the VPC and networks peered or routed to it.
+  # internet-facing: public subnets; requires certificateArn.
+  scheme: internal
+  # ACM certificate for HTTPS on 443. Empty: plain HTTP on 80 (internal scheme only).
+  certificateArn: ""
+  sslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+  host: ""
+  # Who may connect to the ALB. Default: the VPC (terraform vpc_cidr). Add peered/VPN ranges here.
+  allowedCIDRs: ["10.0.0.0/16"]
+  # >= router_settings.timeout, so long non-streaming completions aren't cut off.
+  idleTimeoutSeconds: 600
+  deregistrationDelaySeconds: 60
+  # Optional AWS WAF web ACL (body size limits, IP rate limits; REQUIREMENTS §5).
+  wafAclArn: ""
+  # Share one ALB between several Ingresses.
+  groupName: ""
+  annotations: {}
 
 serviceAccount:
   create: true
@@ -181,6 +205,9 @@ networkPolicy:
   # Prometheus in the observability namespace is always allowed.
   ingressFrom:
     - namespaceSelector: {}
+  # With ingress.enabled, the ALB connects to pod IPs from its own ENIs in these subnets, so
+  # they are allowed too. Keep equal to the VPC CIDR.
+  albSourceCIDRs: ["10.0.0.0/16"]
 
 metrics:
   # /metrics carries key aliases, teams and spend, so LiteLLM requires a key for it. A Job registers

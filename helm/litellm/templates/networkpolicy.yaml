@@ -25,6 +25,12 @@ spec:
             matchLabels:
               {{- include "litellm.selectorLabels" . | nindent 14 }}
               app.kubernetes.io/component: metrics-key-job
+        {{- if .Values.ingress.enabled }}
+        {{- range .Values.networkPolicy.albSourceCIDRs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+        {{- end }}
 {{- if .Values.postgres.enabled }}
 ---
 apiVersion: networking.k8s.io/v1

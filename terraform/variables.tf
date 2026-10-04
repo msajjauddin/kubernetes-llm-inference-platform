@@ -156,6 +156,12 @@ variable "nvidia_device_plugin_chart_version" {
   default = "0.20.1"
 }
 
+variable "aws_load_balancer_controller_chart_version" {
+  description = "aws-load-balancer-controller Helm chart (aws.github.io/eks-charts)."
+  type        = string
+  default     = "3.5.0"
+}
+
 variable "keda_chart_version" {
   description = "KEDA Helm chart (chart version = KEDA version). 2.17+ is needed for the vLLM ScaledObject's fallback behavior."
   type        = string

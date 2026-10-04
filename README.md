@@ -11,6 +11,8 @@ and provisioned with Terraform. Full requirements: [docs/REQUIREMENTS.md](docs/R
 | 2. vLLM serving + KEDA autoscaling | **Done** | `helm/vllm/`, `helm/keda.yaml`, `terraform/addons.tf` |
 | 3. LiteLLM gateway (keys, routing, rate limits, NetworkPolicies) | **Done** | `helm/litellm/`, `k8s/network/`, `k8s/litellm/` |
 | 4. Observability (Prometheus, Grafana, DCGM exporter, alerts) | **Done** (OTel tracing not included) | `terraform/observability.tf`, `helm/kube-prometheus-stack.yaml`, `helm/dcgm-exporter.yaml`, `helm/prometheus-rules/`, `grafana-dashboards/` |
+| ALB entry point for apps outside the cluster | **Done** | `terraform/load_balancer.tf`, `helm/litellm/templates/ingress.yaml` |
+| 5,000-concurrent-request profile + load test | **Done** (sizing estimated, not yet measured) | `docs/CAPACITY.md`, `*/values-5k.yaml`, `terraform/5k.tfvars.example`, `scripts/locustfile.py` |
 
 ## What layer 1 creates
 
@@ -209,8 +211,34 @@ curl -s localhost:4000/v1/chat/completions -H "Authorization: Bearer sk-..." -H 
   -d '{"model": "qwen2.5-7b-instruct", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
-The admin UI is at `http://localhost:4000/ui` (log in with the master key). Production exposure is an
-ALB Ingress with WAF in front of the `litellm` Service (REQUIREMENTS §5); cap request body size there.
+The admin UI is at `http://localhost:4000/ui` (log in with the master key).
+
+### Expose it to other apps (ALB)
+
+Terraform installs the AWS Load Balancer Controller (`terraform/load_balancer.tf`). Turning on the
+chart's Ingress gives the gateway an Application Load Balancer that sends traffic straight to gateway
+pod IPs, so new HPA replicas join it as soon as they're Ready:
+
+```bash
+helm upgrade litellm helm/litellm -n llm --reuse-values \
+  --set ingress.enabled=true \
+  --set ingress.certificateArn=arn:aws:acm:us-east-1:123456789012:certificate/...   # HTTPS on 443
+kubectl -n llm get ingress litellm    # ADDRESS = the ALB's DNS name; point a Route 53 record at it
+```
+
+- `scheme: internal` by default: the ALB lives in the private subnets and only the VPC (plus anything
+  peered or routed to it, listed in `ingress.allowedCIDRs`) can reach it. That fits an internal
+  developer platform. `internet-facing` refuses to render without a certificate.
+- Idle timeout 600 s (the router timeout), so long non-streaming completions aren't cut at the
+  ALB's default 60 s.
+- `ingress.wafAclArn` attaches AWS WAF; request body limits belong there, since LiteLLM's
+  `max_request_size_mb` is Enterprise only.
+- The gateway NetworkPolicy also admits `networkPolicy.albSourceCIDRs` (the VPC) when the Ingress is on,
+  because the ALB connects from its own ENIs, not from a pod.
+
+Give each downstream app its own key. A shared platform (an internal developer platform fronting many
+users) gets one key with limits sized for its share of traffic, up to the ceiling in
+`upperbound_key_generate_params`.
 
 ### Verify
 
@@ -332,16 +360,49 @@ and **vLLM inference** shows TTFT/TPOT against the NFR-1 targets.
   FastAPI sample client to trace yet. An OTel Collector with the spanmetrics connector can be added later and
   pointed at this Prometheus.
 
+## Scaling to 5,000 concurrent requests
+
+The default profile (6 x A10G) holds roughly 400 requests in flight. For 5,000, use the production
+profile; the sizing math, assumptions and risks are in [docs/CAPACITY.md](docs/CAPACITY.md).
+
+```bash
+cd terraform && cp 5k.tfvars.example terraform.tfvars && terraform apply   # g6e.xlarge (L40S), 2..50 GPU nodes
+helm upgrade --install vllm helm/vllm -n llm -f helm/vllm/values-5k.yaml   # FP8, 100 in flight per GPU, 2..50 replicas
+helm upgrade --install litellm helm/litellm -n llm -f helm/litellm/values-5k.yaml \
+  --set ingress.certificateArn=arn:aws:acm:...                                # internal ALB, 10..30 gateway pods
+```
+
+| | Default | 5k profile |
+|---|---|---|
+| GPU | A10G 24 GB, bf16 | L40S 48 GB, FP8 weights |
+| GPU nodes | 1 → 6 | 2 → 50 |
+| In flight per GPU (scale-out target) | 24 | 100 (cap 192) |
+| Gateway pods | 2 → 6 | 10 → 30 |
+| Entry | port-forward | internal ALB |
+| Pre-warm | none | 20 replicas on weekdays 07–19 UTC |
+
+These per-GPU numbers are estimates. Measure them with the load test before relying on them:
+
+```bash
+kubectl apply -f k8s/tests/load-test/locust.yaml
+kubectl -n load-test create configmap locustfile --from-file=scripts/locustfile.py
+kubectl -n load-test create secret generic llm-api-key --from-literal=key=<a key with max_parallel_requests >= 5000>
+kubectl -n load-test port-forward svc/locust-master 8089    # 5000 users, spawn rate 25/s
+```
+
 ## Offline checks for the charts
 
 ```bash
 helm lint helm/vllm helm/litellm
 for c in vllm litellm; do
-  helm template $c helm/$c -n llm --kube-version 1.33.0 | kubeconform -strict -summary \
-    -schema-location default \
-    -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+  for profile in "" "-f helm/$c/values-5k.yaml"; do
+    helm template $c helm/$c -n llm $profile --kube-version 1.33.0 | kubeconform -strict -summary \
+      -schema-location default \
+      -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+  done
 done
-kubeconform -strict -summary k8s/namespaces.yaml k8s/network/
+helm template litellm helm/litellm --set ingress.enabled=true | kubeconform -strict -summary
+kubeconform -strict -summary k8s/namespaces.yaml k8s/network/ k8s/tests/load-test/
 
 # Observability: alert rules and their unit tests, and the upstream charts with our values
 promtool check rules helm/prometheus-rules/llm-platform.yaml
