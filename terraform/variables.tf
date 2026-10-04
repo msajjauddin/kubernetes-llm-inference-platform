@@ -156,6 +156,12 @@ variable "nvidia_device_plugin_chart_version" {
   default = "0.20.1"
 }
 
+variable "keda_chart_version" {
+  description = "KEDA Helm chart (chart version = KEDA version). 2.17+ is needed for the vLLM ScaledObject's fallback behavior."
+  type        = string
+  default     = "2.21.0"
+}
+
 variable "ecr_repositories" {
   description = "ECR repositories to create for images built by CI."
   type        = list(string)

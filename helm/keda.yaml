@@ -1,0 +1,26 @@
+# Rendered by terraform/addons.tf. Chart: kedacore.github.io/charts keda
+# KEDA turns Prometheus queries into HPA metrics for the vLLM ScaledObject (helm/vllm).
+# It needs no AWS access: the only scaler in use is Prometheus, inside the cluster.
+
+nodeSelector:
+  role: system
+
+resources:
+  operator:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+  metricServer:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+  webhooks:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 256Mi

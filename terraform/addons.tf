@@ -59,3 +59,19 @@ resource "helm_release" "cluster_autoscaler" {
     aws_autoscaling_group_tag.gpu_node_template,
   ]
 }
+
+# Event-driven pod autoscaling (FR-11). The vLLM chart's ScaledObject (helm/vllm) scales
+# replicas on vLLM queue depth from Prometheus; replicas that don't fit become Pending
+# pods, which Cluster Autoscaler answers with GPU nodes.
+resource "helm_release" "keda" {
+  name             = "keda"
+  repository       = "https://kedacore.github.io/charts"
+  chart            = "keda"
+  version          = var.keda_chart_version
+  namespace        = "keda"
+  create_namespace = true
+
+  values = [file("${path.module}/../helm/keda.yaml")]
+
+  depends_on = [module.eks]
+}

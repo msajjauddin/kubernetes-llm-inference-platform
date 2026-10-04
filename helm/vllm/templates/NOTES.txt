@@ -1,0 +1,14 @@
+vLLM is serving {{ .Values.model.name }} as "{{ .Values.model.servedName }}" at
+  http://{{ include "vllm.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}/v1
+
+The first replica downloads the model before it turns Ready; watch it with
+  kubectl -n {{ .Release.Namespace }} logs -f deploy/{{ include "vllm.fullname" . }}
+
+Try it:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "vllm.fullname" . }} 8000:{{ .Values.service.port }}
+  curl -s localhost:8000/v1/models
+{{- if .Values.autoscaling.enabled }}
+
+Autoscaling: KEDA keeps {{ .Values.autoscaling.minReplicas }}-{{ .Values.autoscaling.maxReplicas }} replicas from Prometheus at {{ .Values.autoscaling.prometheus.serverAddress }}.
+  kubectl -n {{ .Release.Namespace }} get scaledobject,hpa {{ include "vllm.fullname" . }}
+{{- end }}

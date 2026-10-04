@@ -1,0 +1,6 @@
+apiVersion: v2
+name: vllm
+description: vLLM OpenAI-compatible server on EKS GPU nodes, autoscaled by KEDA (pods) and Cluster Autoscaler (nodes)
+type: application
+version: 0.1.0
+appVersion: "v0.31.0"

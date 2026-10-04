@@ -1,0 +1,149 @@
+# vLLM serving one model. One replica = one pod = one whole GPU = one GPU node (g5/g6.xlarge).
+#   helm upgrade --install vllm helm/vllm -n llm
+
+image:
+  repository: vllm/vllm-openai
+  tag: v0.31.0
+  pullPolicy: IfNotPresent
+
+model:
+  # Hugging Face repo id (or a local path inside the cache volume).
+  name: Qwen/Qwen2.5-7B-Instruct
+  # Name clients (and LiteLLM) use in the "model" field. Also the model_name label on vLLM metrics,
+  # which the autoscaling queries below filter on.
+  servedName: qwen2.5-7b-instruct
+  # Pin a commit for reproducible deploys; empty = latest on the main branch.
+  revision: ""
+  dtype: bfloat16
+  # Caps the KV cache per sequence so long prompts can't OOM a 24 GB GPU (risk table, REQUIREMENTS §9).
+  maxModelLen: 8192
+  gpuMemoryUtilization: 0.90
+  # FR-14. Continuous batching is always on in vLLM.
+  enablePrefixCaching: true
+  # Anything else, e.g. ["--max-num-seqs", "128"], ["--quantization", "fp8"], ["--enable-lora"].
+  extraArgs: []
+
+# Gated models (Llama, Gemma, ...) need a Hugging Face token. Qwen2.5 is public, so this is optional.
+#   kubectl -n llm create secret generic hf-token --from-literal=token=hf_xxx
+huggingface:
+  tokenSecretName: hf-token
+  tokenSecretKey: token
+
+extraEnv: []
+
+service:
+  type: ClusterIP # never exposed outside the cluster (NFR-7); LiteLLM is the only client
+  port: 8000
+
+serviceAccount:
+  create: true
+  name: ""
+
+# Fits a g5.xlarge / g6.xlarge (4 vCPU, 16 GiB, ~3.9 vCPU / ~15 GiB allocatable) next to the
+# node's DaemonSets (aws-node, kube-proxy, EBS CSI, device plugin, later DCGM exporter).
+# If requests don't fit the node type, Cluster Autoscaler refuses to scale up for the pod.
+resources:
+  requests:
+    cpu: "2500m"
+    memory: 10Gi
+    nvidia.com/gpu: 1
+  limits:
+    memory: 14Gi
+    nvidia.com/gpu: 1
+
+# Contract from the cluster layer (README "Contract for later layers").
+nodeSelector:
+  workload: gpu-inference
+tolerations:
+  - key: nvidia.com/gpu
+    operator: Exists
+    effect: NoSchedule
+
+# Model weights, torch.compile and Triton caches. emptyDir on the node's 200 GiB root volume, so a
+# new replica downloads the weights (~15 GB for 7B bf16) when it starts.
+cache:
+  sizeLimit: 80Gi
+# Shared memory for PyTorch / NCCL (REQUIREMENTS §5). Counts against the memory limit.
+shm:
+  sizeLimit: 2Gi
+
+probes:
+  # First start downloads the model and compiles kernels, so allow up to 20 minutes.
+  startup:
+    periodSeconds: 10
+    failureThreshold: 120
+  readiness:
+    periodSeconds: 5
+    failureThreshold: 3
+  liveness:
+    periodSeconds: 15
+    failureThreshold: 4
+
+# Scale-out never needs a spare GPU: a new pod is only created after an old one is gone.
+# This is NFR-4's "Recreate for single-GPU vLLM", but replicas are replaced one at a time so the
+# others keep serving. Set type: Recreate to restart all replicas at once.
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 0
+    maxUnavailable: 1
+
+terminationGracePeriodSeconds: 120
+# Gives the Service time to drop the pod from its endpoints before vLLM stops taking requests.
+preStopSleepSeconds: 15
+
+# Lets Cluster Autoscaler drain one GPU node at a time when scaling in.
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+priorityClassName: ""
+podAnnotations: {}
+podLabels: {}
+
+# Pod replicas. KEDA drives a HorizontalPodAutoscaler from vLLM's own queue metrics; every replica
+# that has no free GPU stays Pending, and Cluster Autoscaler adds a GPU node for it.
+autoscaling:
+  enabled: true
+  minReplicas: 1
+  # Keep equal to gpu_max_size in terraform (one GPU per node, one GPU per replica).
+  maxReplicas: 6
+  pollingInterval: 15
+  prometheus:
+    # Created by the Prometheus Operator for every Prometheus in the namespace (observability layer).
+    serverAddress: http://prometheus-operated.observability.svc:9090
+  # Target in-flight requests (running + waiting) per replica. NFR-2 measures throughput at 32
+  # concurrent and NFR-1's latency targets need headroom, so scale before a replica reaches that.
+  targetInFlightPerReplica: 24
+  # Average queued requests per replica that also triggers scale-out (KV cache full, long prompts).
+  targetWaitingPerReplica: 4
+  # If Prometheus can't be queried 3 times in a row, never scale in; hold at least minReplicas.
+  fallback:
+    failureThreshold: 3
+    behavior: currentReplicasIfHigher
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+    # Slow scale-in: a new replica costs a node boot plus a model load, so don't give one up early.
+    scaleDown:
+      stabilizationWindowSeconds: 600
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 300
+  # Extra KEDA triggers appended as-is, e.g. LiteLLM request rate once the gateway is deployed.
+  extraTriggers: []
+
+# Used only when autoscaling.enabled is false.
+replicaCount: 1
+
+metrics:
+  # Turn on once the observability layer installs the Prometheus Operator CRDs.
+  serviceMonitor:
+    enabled: false
+    interval: 15s
+    labels: {}

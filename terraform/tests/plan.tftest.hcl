@@ -65,6 +65,11 @@ run "gpu_node_group_scales_with_cluster_autoscaler" {
     condition     = helm_release.cluster_autoscaler.chart == "cluster-autoscaler" && helm_release.nvidia_device_plugin.chart == "nvidia-device-plugin"
     error_message = "GPU add-ons not planned"
   }
+
+  assert {
+    condition     = helm_release.keda.chart == "keda" && helm_release.keda.namespace == "keda"
+    error_message = "KEDA (pod autoscaling for vLLM) not planned"
+  }
 }
 
 run "gpu_can_scale_to_zero" {
