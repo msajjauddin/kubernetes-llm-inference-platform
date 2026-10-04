@@ -142,8 +142,9 @@ autoscaling:
 replicaCount: 1
 
 metrics:
-  # Turn on once the observability layer installs the Prometheus Operator CRDs.
+  # Needs the Prometheus Operator CRDs (terraform/observability.tf). Set false only on a cluster
+  # without them; for vLLM that also leaves KEDA without metrics, so autoscaling stops.
   serviceMonitor:
-    enabled: false
+    enabled: true
     interval: 15s
     labels: {}

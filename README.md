@@ -8,9 +8,9 @@ and provisioned with Terraform. Full requirements: [docs/REQUIREMENTS.md](docs/R
 | Layer | Status | Where |
 |---|---|---|
 | 1. GPU cluster foundation (VPC, EKS, GPU node group, NVIDIA device plugin, Cluster Autoscaler, ECR) | **Done** | `terraform/`, `helm/`, `k8s/namespaces.yaml` |
-| 2. vLLM serving + KEDA autoscaling | **Done** (autoscaling goes live with layer 4's Prometheus) | `helm/vllm/`, `helm/keda.yaml`, `terraform/addons.tf` |
+| 2. vLLM serving + KEDA autoscaling | **Done** | `helm/vllm/`, `helm/keda.yaml`, `terraform/addons.tf` |
 | 3. LiteLLM gateway (keys, routing, rate limits, NetworkPolicies) | **Done** | `helm/litellm/`, `k8s/network/`, `k8s/litellm/` |
-| 4. Observability (Prometheus, Grafana, DCGM exporter, OTel) | Next | `helm/`, `grafana-dashboards/` |
+| 4. Observability (Prometheus, Grafana, DCGM exporter, alerts) | **Done** (OTel tracing not included) | `terraform/observability.tf`, `helm/kube-prometheus-stack.yaml`, `helm/dcgm-exporter.yaml`, `helm/prometheus-rules/`, `grafana-dashboards/` |
 
 ## What layer 1 creates
 
@@ -116,11 +116,9 @@ Why vLLM's queue rather than gateway request rate (REQUIREMENTS §5): request ra
 requests are, while running + waiting is exactly how loaded each GPU is. The gateway's request rate is
 available as an extra trigger in `helm/vllm/values-litellm-trigger.yaml`; KEDA uses whichever asks for more.
 
-**Until Prometheus exists (layer 4)** KEDA can't read the metrics, so it holds vLLM at its current
-replica count (fallback `currentReplicasIfHigher`, never below 1). Nothing breaks; it just doesn't scale.
-Layer 4 needs to: run a Prometheus Operator Prometheus in `observability` (KEDA queries
-`http://prometheus-operated.observability.svc:9090`), and install the chart with
-`--set metrics.serviceMonitor.enabled=true` so vLLM gets scraped with `namespace` and `pod` labels.
+KEDA reads these from the layer 4 Prometheus (`http://prometheus-operated.observability.svc:9090`), which
+scrapes vLLM through the chart's ServiceMonitor. If Prometheus is unreachable, KEDA holds vLLM at its current
+replica count (fallback `currentReplicasIfHigher`, never below 1) and the `KEDAScalerErrors` alert fires.
 
 ### Deploy
 
@@ -139,7 +137,7 @@ Swap the model with `--set model.name=...,model.servedName=...`; extra vLLM flag
 
 ```bash
 scripts/verify-vllm.sh                        # health, model list, one chat completion
-scripts/verify-vllm.sh --load 96 --duration 600   # after layer 4: watch replicas and GPU nodes grow
+scripts/verify-vllm.sh --load 96 --duration 600   # watch replicas and GPU nodes grow (Grafana: Inference autoscaling)
 kubectl -n llm get scaledobject,hpa vllm
 ```
 
@@ -239,17 +237,123 @@ scripts/verify-litellm.sh    # health, chat via gateway, 401 without key, 403 wr
 - **Models in the config file** (`store_model_in_db: false`): model routing changes go through Git and
   `helm upgrade`, not the admin UI.
 
+## Observability (layer 4)
+
+```
+namespace observability  (Terraform: terraform/observability.tf)
+├── kube-prometheus-stack "monitoring"   helm/kube-prometheus-stack.yaml, system nodes
+│   ├── Prometheus Operator              selects ServiceMonitors / PrometheusRules in all namespaces
+│   ├── Prometheus                       15 s scrapes, 7-day retention on a 50 GiB gp3 PVC (NFR-6)
+│   │                                    svc prometheus-operated:9090  <- KEDA (vLLM autoscaling)
+│   ├── Alertmanager                     2 GiB PVC, no receivers configured yet
+│   ├── Grafana                          svc monitoring-grafana:80, dashboards from ConfigMaps
+│   └── kube-state-metrics               replicas, HPA, Pending pods, node labels (workload, instance type)
+├── PrometheusRule llm-platform          helm/prometheus-rules/llm-platform.yaml
+└── ConfigMaps grafana-dashboard-*       one per grafana-dashboards/*.json, folder "LLM Platform"
+namespace kube-system
+├── node-exporter DaemonSet              all nodes, GPU nodes included
+└── dcgm-exporter DaemonSet              GPU nodes only (helm/dcgm-exporter.yaml)
+```
+
+What gets scraped:
+
+| Source | How | Used for |
+|---|---|---|
+| vLLM `/metrics` | ServiceMonitor in `helm/vllm` (on by default) | TTFT, TPOT, throughput, queue, KV cache; KEDA's triggers |
+| LiteLLM `/metrics/` | ServiceMonitor in `helm/litellm`, bearer `LITELLM_METRICS_TOKEN` | requests, errors, latency, tokens, spend per key/team |
+| DCGM exporter | its chart's ServiceMonitor | GPU utilization, tensor activity, memory, power, temperature, XID, which pod holds each GPU |
+| KEDA | `helm/keda.yaml` ServiceMonitors | scaler values and errors |
+| Cluster Autoscaler | `helm/cluster-autoscaler.yaml.tftpl` ServiceMonitor | unschedulable pods, nodes added/removed |
+| Kubernetes | kube-state-metrics, kubelet/cAdvisor, node-exporter | replicas, Pending pods, CPU/memory (FR-10 resource use) |
+
+Dashboards (Grafana folder **LLM Platform**, all tagged `llm-platform`):
+
+| Dashboard | Shows | Requirement |
+|---|---|---|
+| vLLM inference | TTFT and TPOT p50/p90/p99 with NFR-1 targets, output tokens/s per GPU, finished requests, running/waiting, KV cache, prefix-cache hit rate, preemptions | NFR-1, NFR-2, FR-14, AC-2, AC-3, AC-8 |
+| GPU (DCGM) | utilization against the 85% target, tensor/SM/memory-bandwidth activity, memory, power, temperature, clocks, XID, GPU-to-pod table | AC-6 |
+| LiteLLM gateway | requests by status code, 5xx and 429 rates, failures by exception, latency, TTFT through the gateway, tokens, spend by team, usage per key | FR-6, FR-16, AC-4 |
+| Inference autoscaling | the whole chain: in-flight per replica vs KEDA's targets, desired/ready/Pending replicas, GPU nodes by instance type, Cluster Autoscaler activity, KEDA errors | FR-11, NFR-5, AC-5 |
+
+Alerts (`helm/prometheus-rules/llm-platform.yaml`, on top of the chart's Kubernetes and node rules):
+`VLLMUnavailable`, `VLLMTimeToFirstTokenHigh` (p99 > 800 ms), `VLLMTimePerOutputTokenHigh` (p50 > 60 ms),
+`VLLMKVCacheSaturated`, `VLLMCapacityExhausted` (at max replicas and still queueing),
+`VLLMReplicaPendingTooLong` (no GPU node after 10 min), `LiteLLMUnavailable`, `LiteLLMServerErrorRateHigh`
+(5xx > 1%; 401/429 don't count), `LiteLLMDeploymentDown`, `GPUMetricsMissing`, `GPUTemperatureHigh`, `GPUXidError`,
+`GPUFleetIdle` (info, cost), `KEDAScalerErrors` (autoscaling blind), `ClusterAutoscalerUnschedulablePods`.
+
+### Deploy
+
+```bash
+cd terraform && terraform apply      # kube-prometheus-stack, DCGM exporter, alerts, dashboards; KEDA and
+cd ..                                # Cluster Autoscaler pick up their ServiceMonitors
+helm upgrade --install vllm helm/vllm -n llm          # ServiceMonitors are now on by default
+helm upgrade --install litellm helm/litellm -n llm
+scripts/verify-observability.sh      # targets up, KEDA reading metrics, dashboards present, alerts loaded
+```
+
+On a cluster built before this layer, the same `terraform apply` adds it; the two `helm upgrade`s turn on the
+ServiceMonitors (or add `--reuse-values --set metrics.serviceMonitor.enabled=true` if you keep old values).
+
+### Open Grafana
+
+```bash
+kubectl -n observability port-forward svc/monitoring-grafana 3000:80
+kubectl -n observability get secret monitoring-grafana -o jsonpath='{.data.admin-password}' | base64 -d; echo
+# http://localhost:3000, user admin -> Dashboards -> LLM Platform
+kubectl -n observability port-forward svc/prometheus-operated 9090   # Prometheus UI, alerts at /alerts
+```
+
+The chart generates the admin password on first install and keeps it across upgrades. For production put
+Grafana behind an ALB Ingress with SSO (`grafana.ini` `auth.generic_oauth`) rather than port-forwarding.
+
+### Watching a load test (AC-5, AC-6, AC-8)
+
+Run `scripts/verify-vllm.sh --load 96 --duration 600` and open **Inference autoscaling**: in-flight per
+replica crosses 24, desired replicas rise within a polling interval, the new replica shows as Pending until
+Cluster Autoscaler's node joins, then ready. **GPU (DCGM)** shows utilization per GPU against the 85% line,
+and **vLLM inference** shows TTFT/TPOT against the NFR-1 targets.
+
+### Choices
+
+- **Prometheus, Alertmanager and Grafana come from Terraform**, like KEDA, because KEDA's autoscaling and the
+  ServiceMonitors in every other chart depend on them. Dashboards are ConfigMaps from `grafana-dashboards/*.json`;
+  edit the JSON (or export from Grafana) and `terraform apply`. UI edits are not saved (`allowUiUpdates: false`).
+- **Exporters with host access live in `kube-system`.** node-exporter needs hostNetwork/hostPID and the DCGM
+  exporter needs a hostPath (kubelet pod-resources, to map GPUs to pods) and `SYS_ADMIN` (profiling counters).
+  The `observability` namespace enforces Pod Security `baseline`, which forbids those, and stays that way.
+- **No control-plane scraping.** EKS hides the scheduler, controller manager and etcd, and kube-proxy only
+  serves metrics on localhost, so those jobs and their default alerts are off instead of permanently down.
+- **One Prometheus replica.** Enough for one cluster and 7 days. If KEDA must keep scaling through a Prometheus
+  restart, set `prometheus.prometheusSpec.replicas: 2`; the vLLM fallback already prevents scale-in while it's away.
+- **Alertmanager has no receivers.** Alerts show in Prometheus, Alertmanager and Grafana. Add a Slack or
+  PagerDuty receiver with its URL in a Secret, not in Git.
+- **Not included: OpenTelemetry tracing** (REQUIREMENTS §5). Metrics cover FR-10 and the AC-8 panels; there is no
+  FastAPI sample client to trace yet. An OTel Collector with the spanmetrics connector can be added later and
+  pointed at this Prometheus.
+
 ## Offline checks for the charts
 
 ```bash
 helm lint helm/vllm helm/litellm
 for c in vllm litellm; do
-  helm template $c helm/$c -n llm --kube-version 1.33.0 --set metrics.serviceMonitor.enabled=true | kubeconform -strict -summary \
+  helm template $c helm/$c -n llm --kube-version 1.33.0 | kubeconform -strict -summary \
     -schema-location default \
     -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
 done
 kubeconform -strict -summary k8s/namespaces.yaml k8s/network/
+
+# Observability: alert rules and their unit tests, and the upstream charts with our values
+promtool check rules helm/prometheus-rules/llm-platform.yaml
+promtool test rules helm/prometheus-rules/tests.yaml
+helm template monitoring prometheus-community/kube-prometheus-stack --version 91.9.0 -n observability \
+  --kube-version 1.33.0 -f helm/kube-prometheus-stack.yaml | kubeconform -strict -summary -schema-location default \
+  -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
 ```
+
+The dashboards' queries and the KEDA queries were also run against a local Prometheus 3.6 scraping synthetic
+vLLM 0.31, LiteLLM 1.104, DCGM, kube-state-metrics, KEDA and Cluster Autoscaler metrics (metric and label names
+taken from those projects' source at the pinned versions); every panel returned data.
 
 The LiteLLM config was also run for real (LiteLLM 1.104.0 with local Postgres and Redis and a stub
 OpenAI server in place of vLLM) to check auth, routing, streaming, per-key 429s, the scrape key and
@@ -276,11 +380,11 @@ Everything else should use `nodeSelector: {role: system}`.
 vLLM's in-cluster endpoint for LiteLLM is `http://vllm.llm.svc:8000/v1`, model `qwen2.5-7b-instruct`.
 Clients use the gateway at `http://litellm.llm.svc:4000/v1`.
 
-For the observability layer: run Prometheus in the `observability` namespace (the NetworkPolicies already
-let it scrape `llm`), then `helm upgrade litellm helm/litellm -n llm --reuse-values --set metrics.serviceMonitor.enabled=true`
-(and the same for vllm). LiteLLM's ServiceMonitor scrapes `/metrics/` with the `LITELLM_METRICS_TOKEN`
-bearer token from `litellm-secrets`. Optionally add `helm/vllm/values-litellm-trigger.yaml` for the
-request-rate KEDA trigger. `terraform output` exposes
+Prometheus (layer 4) selects every ServiceMonitor, PodMonitor and PrometheusRule in the cluster, whatever
+its labels, so a new workload only needs a ServiceMonitor to be scraped, and a ConfigMap labelled
+`grafana_dashboard: "1"` to add a dashboard. The vLLM and LiteLLM charts create their ServiceMonitors by
+default. Optionally add `helm/vllm/values-litellm-trigger.yaml` for the request-rate KEDA trigger.
+`terraform output` exposes
 `gpu_node_selector`, `gpu_toleration`, `ecr_repository_urls`, `node_security_group_id` and the
 cluster details for scripts and CI.
 

@@ -85,3 +85,27 @@ run "gpu_can_scale_to_zero" {
     error_message = "gpu_min_size = 0 should be accepted"
   }
 }
+
+run "observability_feeds_autoscaling_and_dashboards" {
+  command = plan
+
+  assert {
+    condition     = helm_release.kube_prometheus_stack.namespace == "observability" && helm_release.kube_prometheus_stack.chart == "kube-prometheus-stack"
+    error_message = "Prometheus must run in observability: KEDA queries prometheus-operated.observability.svc"
+  }
+
+  assert {
+    condition     = strcontains(helm_release.kube_prometheus_stack.values[1], "VLLMReplicaPendingTooLong")
+    error_message = "LLM platform alert rules not passed to Prometheus"
+  }
+
+  assert {
+    condition     = helm_release.dcgm_exporter.namespace == "kube-system"
+    error_message = "DCGM exporter needs hostPath + SYS_ADMIN, which the observability namespace's PSS baseline forbids"
+  }
+
+  assert {
+    condition     = toset(keys(kubernetes_config_map_v1.grafana_dashboard)) == toset(["autoscaling.json", "gpu.json", "litellm.json", "vllm.json"])
+    error_message = "Expected one Grafana dashboard ConfigMap per file in grafana-dashboards/"
+  }
+}

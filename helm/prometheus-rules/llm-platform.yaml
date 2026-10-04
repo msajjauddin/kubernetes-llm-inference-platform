@@ -1,0 +1,209 @@
+# LLM platform alerts, loaded into Prometheus as a PrometheusRule by terraform/observability.tf
+# (kube-prometheus-stack additionalPrometheusRulesMap). Kubernetes, node and Prometheus alerts come
+# from the chart's default rules.
+#
+# Thresholds follow docs/REQUIREMENTS.md: NFR-1 latency, AC-4 error rate, AC-5 scale-out time.
+# Test offline: promtool test rules helm/prometheus-rules/tests.yaml
+groups:
+  - name: llm-platform.vllm
+    rules:
+      - alert: VLLMUnavailable
+        expr: absent(up{namespace="llm", job="vllm"} == 1)
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: No vLLM replica is serving metrics
+          description: >-
+            Prometheus has not scraped a healthy vLLM pod in namespace llm for 5 minutes. The
+            gateway has nothing to route to, and KEDA can't scale vLLM without its metrics.
+            Check `kubectl -n llm get pods -l app.kubernetes.io/name=vllm` and the pod logs.
+
+      - alert: VLLMTimeToFirstTokenHigh
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le, model_name) (rate(vllm:time_to_first_token_seconds_bucket{namespace="llm"}[5m]))
+          ) > 0.8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "vLLM p99 time to first token above 800 ms ({{ $labels.model_name }})"
+          description: >-
+            p99 TTFT is {{ $value | humanizeDuration }}, over the NFR-1 target of 800 ms. Usually
+            queueing: check vLLM waiting requests and whether KEDA is scaling (autoscaling dashboard).
+
+      - alert: VLLMTimePerOutputTokenHigh
+        expr: |
+          histogram_quantile(0.5,
+            sum by (le, model_name) (rate(vllm:inter_token_latency_seconds_bucket{namespace="llm"}[5m]))
+          ) > 0.06
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "vLLM median time per output token above 60 ms ({{ $labels.model_name }})"
+          description: >-
+            p50 inter-token latency is {{ $value | humanizeDuration }}, over the NFR-1 target of 60 ms.
+            Batches are too large for the GPU; lower --max-num-seqs or the KEDA in-flight target.
+
+      - alert: VLLMKVCacheSaturated
+        expr: max by (pod, model_name) (vllm:kv_cache_usage_perc{namespace="llm"}) > 0.95
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "vLLM KV cache over 95% on {{ $labels.pod }}"
+          description: >-
+            The KV cache has been nearly full for 10 minutes, so new requests wait and running ones
+            get preempted. KEDA's waiting-requests trigger should be adding replicas.
+
+      - alert: VLLMCapacityExhausted
+        expr: |
+          (
+            kube_horizontalpodautoscaler_status_desired_replicas{namespace="llm", horizontalpodautoscaler="vllm"}
+              >= on (namespace, horizontalpodautoscaler)
+            kube_horizontalpodautoscaler_spec_max_replicas{namespace="llm", horizontalpodautoscaler="vllm"}
+          )
+          and on (namespace)
+          (sum by (namespace) (vllm:num_requests_waiting{namespace="llm"}) > 0)
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: vLLM is at its replica ceiling and requests are still queueing
+          description: >-
+            KEDA wants more vLLM replicas than maxReplicas allows. Raise autoscaling.maxReplicas
+            in helm/vllm together with gpu_max_size in Terraform, or shed load at the gateway.
+
+      - alert: VLLMReplicaPendingTooLong
+        expr: |
+          count by (namespace) (
+            kube_pod_status_phase{namespace="llm", pod=~"vllm-.*", phase="Pending"} == 1
+          ) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} vLLM replica(s) Pending for 10 minutes"
+          description: >-
+            A vLLM pod has been waiting for a GPU for 10 minutes, so Cluster Autoscaler has not added
+            a GPU node (AC-5 expects one within 5 minutes). Usual causes: gpu_max_size reached, no
+            g5/g6 capacity in the AZs, or the EC2 G-instance vCPU quota. Check
+            `kubectl -n kube-system logs deploy/cluster-autoscaler`.
+
+  - name: llm-platform.gateway
+    rules:
+      - alert: LiteLLMUnavailable
+        expr: absent(up{namespace="llm", job="litellm"} == 1)
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: No LiteLLM gateway pod is serving metrics
+          description: >-
+            Prometheus has not scraped a healthy LiteLLM pod for 5 minutes. If the pods are up,
+            check that the litellm-metrics-key Job succeeded (the scrape key) with
+            `kubectl -n llm get jobs`.
+
+      - alert: LiteLLMServerErrorRateHigh
+        expr: |
+          sum by (namespace) (rate(litellm_proxy_total_requests_metric_total{namespace="llm", status_code=~"5.."}[5m]))
+            /
+          sum by (namespace) (rate(litellm_proxy_total_requests_metric_total{namespace="llm"}[5m]))
+            > 0.01
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: LiteLLM 5xx rate above 1%
+          description: >-
+            {{ $value | humanizePercentage }} of gateway requests are failing with a server error
+            (AC-4 allows under 1%). 4xx such as 401 and 429 are excluded: those are the gateway
+            doing its job. See the LiteLLM dashboard for the failing model and exception.
+
+      - alert: LiteLLMDeploymentDown
+        expr: max by (litellm_model_name, api_base) (litellm_deployment_state{namespace="llm"}) == 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "LiteLLM marks deployment {{ $labels.litellm_model_name }} as down"
+          description: >-
+            LiteLLM's router has put {{ $labels.api_base }} in outage state (failing calls, cooled
+            down). Requests go to other deployments of the model, if there are any.
+
+  - name: llm-platform.gpu
+    rules:
+      - alert: GPUMetricsMissing
+        expr: |
+          kube_node_labels{label_workload="gpu-inference"}
+            unless on (node)
+          DCGM_FI_DEV_GPU_UTIL
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No GPU metrics from {{ $labels.node }}"
+          description: >-
+            The GPU node has been up 15 minutes without DCGM exporter metrics, so GPU dashboards and
+            alerts are blind for it. Check `kubectl -n kube-system get pods -l app.kubernetes.io/name=dcgm-exporter -o wide`.
+
+      - alert: GPUTemperatureHigh
+        expr: DCGM_FI_DEV_GPU_TEMP > 85
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "GPU {{ $labels.gpu }} on {{ $labels.node }} at {{ $value }} C"
+          description: The GPU will throttle its clocks and tokens per second will drop.
+
+      - alert: GPUXidError
+        expr: changes(DCGM_FI_DEV_XID_ERRORS[10m]) > 0 and DCGM_FI_DEV_XID_ERRORS > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "GPU XID error {{ $value }} on {{ $labels.node }}"
+          description: >-
+            The NVIDIA driver reported XID {{ $value }}. 48, 63, 64, 74, 79 and 94/95 usually mean
+            the GPU or node needs replacing: cordon and drain the node so the ASG replaces it.
+
+      - alert: GPUFleetIdle
+        expr: |
+          avg(DCGM_FI_DEV_GPU_UTIL) < 10
+            and
+          count(kube_node_labels{label_workload="gpu-inference"}) > 1
+        for: 1h
+        labels:
+          severity: info
+        annotations:
+          summary: "Several GPU nodes running at {{ $value | humanize }}% average utilization"
+          description: >-
+            More than one GPU node has been almost idle for an hour (NFR-9). If scale-in is not
+            happening, check the vLLM HPA and Cluster Autoscaler's scale-down logs.
+
+  - name: llm-platform.autoscaling
+    rules:
+      - alert: KEDAScalerErrors
+        expr: sum by (scaledObject) (rate(keda_scaler_detail_errors_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "KEDA can't read the metrics for ScaledObject {{ $labels.scaledObject }}"
+          description: >-
+            KEDA's Prometheus queries are failing, so it holds the workload at its current replica
+            count (fallback) and won't scale out under load. Check
+            `kubectl -n llm describe scaledobject {{ $labels.scaledObject }}` and that Prometheus
+            is reachable at prometheus-operated.observability.svc:9090.
+
+      - alert: ClusterAutoscalerUnschedulablePods
+        expr: max(cluster_autoscaler_unschedulable_pods_count) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} pod(s) unschedulable for 15 minutes"
+          description: >-
+            Cluster Autoscaler can't find or add a node for these pods. For GPU pods: gpu_max_size,
+            EC2 capacity or quota. `kubectl get pods -A --field-selector=status.phase=Pending`.

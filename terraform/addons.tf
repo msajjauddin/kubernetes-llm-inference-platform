@@ -1,5 +1,6 @@
-# In-cluster add-ons that the GPU layer depends on. Later layers (vLLM, LiteLLM,
-# observability) are deployed from k8s/ and helm/, not from Terraform.
+# In-cluster add-ons that the GPU layer depends on. The workloads (vLLM, LiteLLM) are deployed
+# from k8s/ and helm/, not from Terraform; Prometheus, Grafana and the DCGM exporter are in
+# observability.tf.
 
 # Default StorageClass for PVCs (Prometheus, LiteLLM DB, model cache).
 resource "kubernetes_storage_class_v1" "gp3" {
@@ -57,6 +58,7 @@ resource "helm_release" "cluster_autoscaler" {
     module.eks,
     module.cluster_autoscaler_pod_identity,
     aws_autoscaling_group_tag.gpu_node_template,
+    helm_release.kube_prometheus_stack, # ServiceMonitor CRD
   ]
 }
 
@@ -73,5 +75,8 @@ resource "helm_release" "keda" {
 
   values = [file("${path.module}/../helm/keda.yaml")]
 
-  depends_on = [module.eks]
+  depends_on = [
+    module.eks,
+    helm_release.kube_prometheus_stack, # ServiceMonitor CRD
+  ]
 }

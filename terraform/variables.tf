@@ -162,6 +162,18 @@ variable "keda_chart_version" {
   default     = "2.21.0"
 }
 
+variable "kube_prometheus_stack_chart_version" {
+  description = "prometheus-community kube-prometheus-stack chart (Prometheus Operator, Prometheus, Alertmanager, Grafana)."
+  type        = string
+  default     = "91.9.0"
+}
+
+variable "dcgm_exporter_chart_version" {
+  description = "NVIDIA dcgm-exporter chart (GPU metrics)."
+  type        = string
+  default     = "4.8.4"
+}
+
 variable "ecr_repositories" {
   description = "ECR repositories to create for images built by CI."
   type        = list(string)

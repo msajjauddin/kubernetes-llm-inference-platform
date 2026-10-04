@@ -24,3 +24,16 @@ resources:
       memory: 64Mi
     limits:
       memory: 256Mi
+
+# Scrape KEDA itself (Prometheus Operator ServiceMonitors, observability layer): scaler values,
+# scaler errors and ScaledObject errors, shown on the autoscaling dashboard and alerted on when
+# KEDA can't read Prometheus (vLLM then stops scaling).
+prometheus:
+  operator:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+  metricServer:
+    enabled: true
+    serviceMonitor:
+      enabled: true
