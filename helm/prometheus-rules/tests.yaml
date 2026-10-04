@@ -1,0 +1,177 @@
+# promtool test rules helm/prometheus-rules/tests.yaml
+rule_files:
+  - llm-platform.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # p99 TTFT ~1.5 s for 15 minutes: every request lands in the 1-2.5 s bucket.
+  - interval: 1m
+    input_series:
+      - series: 'vllm:time_to_first_token_seconds_bucket{namespace="llm",model_name="qwen2.5-7b-instruct",pod="vllm-a",le="0.8"}'
+        values: "0+0x20"
+      - series: 'vllm:time_to_first_token_seconds_bucket{namespace="llm",model_name="qwen2.5-7b-instruct",pod="vllm-a",le="2.5"}'
+        values: "0+60x20"
+      - series: 'vllm:time_to_first_token_seconds_bucket{namespace="llm",model_name="qwen2.5-7b-instruct",pod="vllm-a",le="+Inf"}'
+        values: "0+60x20"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: VLLMTimeToFirstTokenHigh
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: VLLMTimeToFirstTokenHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              model_name: qwen2.5-7b-instruct
+            exp_annotations:
+              summary: "vLLM p99 time to first token above 800 ms (qwen2.5-7b-instruct)"
+              description: >-
+                p99 TTFT is 2.483s, over the NFR-1 target of 800 ms. Usually queueing: check vLLM
+                waiting requests and whether KEDA is scaling (autoscaling dashboard).
+
+  # No vLLM target at all, then a healthy one.
+  - interval: 1m
+    input_series:
+      - series: 'up{namespace="llm",job="vllm",pod="vllm-a"}'
+        values: "0x10 1x10"
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: VLLMUnavailable
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: No vLLM replica is serving metrics
+              description: >-
+                Prometheus has not scraped a healthy vLLM pod in namespace llm for 5 minutes. The
+                gateway has nothing to route to, and KEDA can't scale vLLM without its metrics.
+                Check `kubectl -n llm get pods -l app.kubernetes.io/name=vllm` and the pod logs.
+      - eval_time: 15m
+        alertname: VLLMUnavailable
+        exp_alerts: []
+
+  # 2% of gateway requests are 5xx, plenty of 429s that must not count.
+  - interval: 1m
+    input_series:
+      - series: 'litellm_proxy_total_requests_metric_total{namespace="llm",status_code="200"}'
+        values: "0+980x20"
+      - series: 'litellm_proxy_total_requests_metric_total{namespace="llm",status_code="429"}'
+        values: "0+500x20"
+      - series: 'litellm_proxy_total_requests_metric_total{namespace="llm",status_code="500"}'
+        values: "0+30x20"
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: LiteLLMServerErrorRateHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: llm
+            exp_annotations:
+              summary: LiteLLM 5xx rate above 1%
+              description: >-
+                1.987% of gateway requests are failing with a server error (AC-4 allows under 1%).
+                4xx such as 401 and 429 are excluded: those are the gateway doing its job. See the
+                LiteLLM dashboard for the failing model and exception.
+
+  # Only 429s: no alert.
+  - interval: 1m
+    input_series:
+      - series: 'litellm_proxy_total_requests_metric_total{namespace="llm",status_code="200"}'
+        values: "0+100x20"
+      - series: 'litellm_proxy_total_requests_metric_total{namespace="llm",status_code="429"}'
+        values: "0+100x20"
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: LiteLLMServerErrorRateHigh
+        exp_alerts: []
+
+  # A vLLM replica waiting for a GPU node for 12 minutes.
+  - interval: 1m
+    input_series:
+      - series: 'kube_pod_status_phase{namespace="llm",pod="vllm-7d9f-abcde",phase="Pending"}'
+        values: "1x15"
+      - series: 'kube_pod_status_phase{namespace="llm",pod="vllm-7d9f-fghij",phase="Pending"}'
+        values: "0x15"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: VLLMReplicaPendingTooLong
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: VLLMReplicaPendingTooLong
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: llm
+            exp_annotations:
+              summary: "1 vLLM replica(s) Pending for 10 minutes"
+              description: >-
+                A vLLM pod has been waiting for a GPU for 10 minutes, so Cluster Autoscaler has not
+                added a GPU node (AC-5 expects one within 5 minutes). Usual causes: gpu_max_size
+                reached, no g5/g6 capacity in the AZs, or the EC2 G-instance vCPU quota. Check
+                `kubectl -n kube-system logs deploy/cluster-autoscaler`.
+
+  # At max replicas with requests queueing.
+  - interval: 1m
+    input_series:
+      - series: 'kube_horizontalpodautoscaler_status_desired_replicas{namespace="llm",horizontalpodautoscaler="vllm"}'
+        values: "6x15"
+      - series: 'kube_horizontalpodautoscaler_spec_max_replicas{namespace="llm",horizontalpodautoscaler="vllm"}'
+        values: "6x15"
+      - series: 'vllm:num_requests_waiting{namespace="llm",pod="vllm-a",model_name="qwen2.5-7b-instruct"}'
+        values: "12x15"
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: VLLMCapacityExhausted
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: llm
+              horizontalpodautoscaler: vllm
+            exp_annotations:
+              summary: vLLM is at its replica ceiling and requests are still queueing
+              description: >-
+                KEDA wants more vLLM replicas than maxReplicas allows. Raise autoscaling.maxReplicas
+                in helm/vllm together with gpu_max_size in Terraform, or shed load at the gateway.
+
+  # A GPU node whose DCGM exporter never reports, next to one that does.
+  - interval: 1m
+    input_series:
+      - series: 'kube_node_labels{node="ip-10-0-1-1",label_workload="gpu-inference"}'
+        values: "1x20"
+      - series: 'kube_node_labels{node="ip-10-0-2-2",label_workload="gpu-inference"}'
+        values: "1x20"
+      - series: 'DCGM_FI_DEV_GPU_UTIL{node="ip-10-0-1-1",gpu="0"}'
+        values: "90x20"
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: GPUMetricsMissing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              node: ip-10-0-2-2
+              label_workload: gpu-inference
+            exp_annotations:
+              summary: "No GPU metrics from ip-10-0-2-2"
+              description: >-
+                The GPU node has been up 15 minutes without DCGM exporter metrics, so GPU dashboards
+                and alerts are blind for it. Check `kubectl -n kube-system get pods -l app.kubernetes.io/name=dcgm-exporter -o wide`.
+
+  # KEDA failing to query Prometheus.
+  - interval: 1m
+    input_series:
+      - series: 'keda_scaler_detail_errors_total{exported_namespace="llm",scaledObject="vllm",scaler="prometheusScaler",triggerIndex="0"}'
+        values: "0+2x15"
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: KEDAScalerErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              scaledObject: vllm
+            exp_annotations:
+              summary: "KEDA can't read the metrics for ScaledObject vllm"
+              description: >-
+                KEDA's Prometheus queries are failing, so it holds the workload at its current replica
+                count (fallback) and won't scale out under load. Check `kubectl -n llm describe
+                scaledobject vllm` and that Prometheus is reachable at prometheus-operated.observability.svc:9090.

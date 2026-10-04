@@ -1,0 +1,50 @@
+# Rendered by terraform/addons.tf. Chart: kubernetes.github.io/autoscaler cluster-autoscaler
+cloudProvider: aws
+fullnameOverride: cluster-autoscaler
+awsRegion: ${region}
+
+# Finds every ASG tagged k8s.io/cluster-autoscaler/enabled + k8s.io/cluster-autoscaler/${cluster_name}
+# (EKS managed node groups add these tags automatically).
+autoDiscovery:
+  clusterName: ${cluster_name}
+
+image:
+  tag: ${image_tag}
+
+rbac:
+  serviceAccount:
+    create: true
+    # Must match the EKS Pod Identity association in terraform/iam.tf.
+    name: cluster-autoscaler
+
+extraArgs:
+  # Pick the node group that wastes the least CPU/memory/GPU for the pending pods.
+  expander: least-waste
+  balance-similar-node-groups: true
+  skip-nodes-with-system-pods: false
+  skip-nodes-with-local-storage: false
+  # GPU nodes take a few minutes to boot and pull the vLLM image; don't give up on them early.
+  max-node-provision-time: 15m
+  # Scale-in: remove a GPU node after it has been under 50% requested for 10 minutes.
+  scale-down-enabled: true
+  scale-down-unneeded-time: 10m
+  scale-down-delay-after-add: 10m
+  scale-down-utilization-threshold: "0.5"
+  scan-interval: 10s
+
+nodeSelector:
+  role: system
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 300Mi
+  limits:
+    memory: 600Mi
+
+# Scale-up/scale-down activity, unschedulable pods and node counts for the autoscaling dashboard.
+serviceMonitor:
+  enabled: true
+  namespace: kube-system
+  interval: 15s
+  selector: {}

@@ -1,0 +1,17 @@
+LiteLLM gateway: http://{{ include "litellm.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}/v1
+Models: {{ range .Values.config.model_list }}{{ .model_name }} {{ end }}
+
+The pods need the Secret "{{ .Values.existingSecret }}" (scripts/create-litellm-secrets.sh).
+
+Try it:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "litellm.fullname" . }} 4000:{{ .Values.service.port }}
+  export LITELLM_MASTER_KEY=$(kubectl -n {{ .Release.Namespace }} get secret {{ .Values.existingSecret }} -o jsonpath='{.data.LITELLM_MASTER_KEY}' | base64 -d)
+  curl -s localhost:4000/v1/models -H "Authorization: Bearer $LITELLM_MASTER_KEY"
+{{- if include "litellm.hasDatabase" . }}
+
+Give an app its own key (rate limits and budget per key):
+  curl -s localhost:4000/key/generate -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+    -H 'Content-Type: application/json' -d '{"key_alias":"team-a","models":["{{ (index .Values.config.model_list 0).model_name }}"],"rpm_limit":60}'
+{{- end }}
+
+Metrics for Prometheus: GET /metrics/ on port {{ .Values.service.port }}{{ if .Values.metrics.requireAuth }} with "Authorization: Bearer $LITELLM_METRICS_TOKEN"{{ end }}{{ if not .Values.metrics.serviceMonitor.enabled }} (set metrics.serviceMonitor.enabled=true once the Prometheus Operator is installed){{ end }}.

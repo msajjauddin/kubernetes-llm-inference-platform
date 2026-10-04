@@ -1,0 +1,39 @@
+# Stand-in for vLLM replicas: each pod holds one whole GPU and does nothing.
+# scripts/verify-gpu-scaling.sh scales this up to force Cluster Autoscaler to add GPU nodes,
+# then back to 0 to watch them get removed.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gpu-test
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gpu-scale-test
+  namespace: gpu-test
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: gpu-scale-test
+  template:
+    metadata:
+      labels:
+        app: gpu-scale-test
+    spec:
+      nodeSelector:
+        workload: gpu-inference
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: hold-gpu
+          image: nvcr.io/nvidia/cuda:12.6.3-base-ubuntu24.04
+          command: ["sh", "-c", "nvidia-smi -L && sleep infinity"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              nvidia.com/gpu: 1

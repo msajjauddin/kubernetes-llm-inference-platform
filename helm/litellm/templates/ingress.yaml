@@ -1,0 +1,58 @@
+{{- if .Values.ingress.enabled }}
+{{- $i := .Values.ingress }}
+{{- if and (eq $i.scheme "internet-facing") (not $i.certificateArn) }}
+{{- fail "ingress.scheme=internet-facing needs ingress.certificateArn: API keys must not cross the internet in plain HTTP" }}
+{{- end }}
+# Application Load Balancer in front of the gateway, created by the AWS Load Balancer Controller
+# (terraform/load_balancer.tf). Targets are gateway pod IPs, so new HPA replicas join it directly.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "litellm.fullname" . }}
+  labels:
+    {{- include "litellm.labels" . | nindent 4 }}
+  annotations:
+    alb.ingress.kubernetes.io/scheme: {{ $i.scheme }}
+    alb.ingress.kubernetes.io/target-type: ip
+    {{- if $i.groupName }}
+    alb.ingress.kubernetes.io/group.name: {{ $i.groupName }}
+    {{- end }}
+    {{- if $i.certificateArn }}
+    alb.ingress.kubernetes.io/certificate-arn: {{ $i.certificateArn }}
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-policy: {{ $i.sslPolicy }}
+    {{- else }}
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80}]'
+    {{- end }}
+    alb.ingress.kubernetes.io/inbound-cidrs: {{ join "," $i.allowedCIDRs }}
+    # Unauthenticated liveness endpoint; the ALB only routes to pods that answer it.
+    alb.ingress.kubernetes.io/healthcheck-path: /health/liveliness
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "10"
+    alb.ingress.kubernetes.io/healthy-threshold-count: "2"
+    # Non-streaming completions can run for minutes; the ALB default of 60 s would cut them off.
+    # Keep this at or above router_settings.timeout.
+    alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds={{ $i.idleTimeoutSeconds }}
+    # Matches the pod's preStop sleep + graceful shutdown, so in-flight streams finish on scale-in.
+    alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds={{ $i.deregistrationDelaySeconds }}
+    {{- with $i.wafAclArn }}
+    alb.ingress.kubernetes.io/wafv2-acl-arn: {{ . }}
+    {{- end }}
+    {{- with $i.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  ingressClassName: alb
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "litellm.fullname" . }}
+                port:
+                  name: http
+      {{- with $i.host }}
+      host: {{ . }}
+      {{- end }}
+{{- end }}

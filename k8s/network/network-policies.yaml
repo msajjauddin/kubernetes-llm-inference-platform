@@ -1,0 +1,41 @@
+# SEC-1 / SEC-2 / SEC-7 for the llm namespace. Enforced by the VPC CNI network policy agent
+# (enableNetworkPolicy on the vpc-cni add-on, terraform/eks.tf).
+#
+# Everything is denied inbound unless a policy allows it:
+#   any pod            -> LiteLLM :4000        (helm/litellm networkpolicy.yaml)
+#   LiteLLM            -> Postgres, Redis       (helm/litellm networkpolicy.yaml)
+#   LiteLLM            -> vLLM :8000            (below)
+#   observability ns   -> LiteLLM, vLLM metrics (Prometheus scrape)
+# Egress stays open: DNS, Hugging Face downloads and any external fallback providers.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: llm
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress"]
+---
+# vLLM has no auth of its own, so only the gateway (and Prometheus) may reach it (NFR-7, AC-7).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: vllm-from-litellm
+  namespace: llm
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: vllm
+  policyTypes: ["Ingress"]
+  ingress:
+    - ports:
+        - port: 8000
+          protocol: TCP
+      from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: litellm
+              app.kubernetes.io/component: gateway
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability

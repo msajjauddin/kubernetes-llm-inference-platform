@@ -1,0 +1,11 @@
+# Copy to backend.tf to keep state in S3 instead of on your laptop.
+# The bucket must exist before `terraform init`.
+terraform {
+  backend "s3" {
+    bucket       = "CHANGE-ME-terraform-state"
+    key          = "llm-inference-platform/terraform.tfstate"
+    region       = "us-east-1"
+    encrypt      = true
+    use_lockfile = true
+  }
+}

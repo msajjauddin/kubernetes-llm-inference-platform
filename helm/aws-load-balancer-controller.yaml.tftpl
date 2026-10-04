@@ -1,0 +1,25 @@
+# Rendered by terraform/load_balancer.tf. Chart: aws.github.io/eks-charts aws-load-balancer-controller
+clusterName: ${cluster_name}
+region: ${region}
+# Set explicitly so the controller doesn't need IMDS access from the pod.
+vpcId: ${vpc_id}
+
+serviceAccount:
+  create: true
+  # Must match the EKS Pod Identity association in terraform/load_balancer.tf.
+  name: aws-load-balancer-controller
+
+# Two replicas with leader election; the webhook must stay up or Service/Ingress changes are refused.
+replicaCount: 2
+nodeSelector:
+  role: system
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+
+serviceMonitor:
+  enabled: true

@@ -1,0 +1,49 @@
+{{- if .Values.autoscaling.enabled }}
+{{- $a := .Values.autoscaling }}
+{{- $sel := include "vllm.metricSelector" . }}
+# KEDA creates and drives an HPA for the vLLM Deployment from vLLM's own metrics (via Prometheus).
+# A replica that finds no free GPU stays Pending, which is what makes Cluster Autoscaler add a GPU node.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ include "vllm.fullname" . }}
+  labels:
+    {{- include "vllm.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    name: {{ include "vllm.fullname" . }}
+  minReplicaCount: {{ $a.minReplicas }}
+  maxReplicaCount: {{ $a.maxReplicas }}
+  pollingInterval: {{ $a.pollingInterval }}
+  fallback:
+    failureThreshold: {{ $a.fallback.failureThreshold }}
+    replicas: {{ $a.minReplicas }}
+    behavior: {{ $a.fallback.behavior }}
+  advanced:
+    horizontalPodAutoscalerConfig:
+      name: {{ include "vllm.fullname" . }}
+      behavior:
+        {{- toYaml $a.behavior | nindent 8 }}
+  triggers:
+    # Requests being decoded plus requests queued, averaged over replicas.
+    - type: prometheus
+      name: in-flight-requests
+      metricType: AverageValue
+      metadata:
+        serverAddress: {{ $a.prometheus.serverAddress }}
+        query: sum({__name__=~"vllm:num_requests_(running|waiting)",{{ $sel }}})
+        threshold: {{ $a.targetInFlightPerReplica | quote }}
+        ignoreNullValues: "true"
+    # Requests the scheduler couldn't fit into the running batch (KV cache full).
+    - type: prometheus
+      name: waiting-requests
+      metricType: AverageValue
+      metadata:
+        serverAddress: {{ $a.prometheus.serverAddress }}
+        query: sum(vllm:num_requests_waiting{ {{- $sel -}} })
+        threshold: {{ $a.targetWaitingPerReplica | quote }}
+        ignoreNullValues: "true"
+    {{- with $a.extraTriggers }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

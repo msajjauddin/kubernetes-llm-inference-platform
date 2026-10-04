@@ -1,0 +1,16 @@
+# Optional: also scale vLLM on gateway request rate (REQUIREMENTS §5 "scale signal"). KEDA takes the
+# larger of this and the queue-depth triggers, so this only adds earlier scale-out on traffic ramps.
+#   helm upgrade vllm helm/vllm -n llm --reuse-values -f helm/vllm/values-litellm-trigger.yaml
+# Needs LiteLLM scraped by Prometheus (helm/litellm metrics.serviceMonitor.enabled=true).
+autoscaling:
+  extraTriggers:
+    - type: prometheus
+      name: gateway-request-rate
+      metricType: AverageValue
+      metadata:
+        serverAddress: http://prometheus-operated.observability.svc:9090
+        query: sum(rate(litellm_proxy_total_requests_metric_total{namespace="llm",requested_model="qwen2.5-7b-instruct"}[2m]))
+        # Requests/s per replica. ~24 in flight at ~20 s per 512-token answer is ~1.2 req/s, so 1.0
+        # asks for a new replica a little before the queue triggers would. Tune from the AC-5 load test.
+        threshold: "1.0"
+        ignoreNullValues: "true"

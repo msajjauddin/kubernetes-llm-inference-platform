@@ -1,0 +1,47 @@
+# Rendered by terraform/observability.tf. Chart: nvidia.github.io/dcgm-exporter dcgm-exporter
+# Release "dcgm-exporter" in kube-system.
+#
+# One pod per GPU node exporting DCGM_FI_DEV_GPU_UTIL, framebuffer use, power, temperature, XID
+# errors and the profiling counters (DCGM_FI_PROF_*). Each GPU's metrics carry the pod that holds
+# it, as exported_pod / exported_namespace (the chart default honorLabels: false keeps the
+# exporter's own pod/namespace target labels separate).
+#
+# Why kube-system: the exporter reads the kubelet pod-resources socket through a hostPath and
+# needs CAP_SYS_ADMIN for the profiling metrics. Pod Security "baseline", which the observability
+# namespace enforces, forbids both.
+
+# Same scheduling contract as vLLM (README "Contract for later layers"). The exporter does not
+# request nvidia.com/gpu, so it never takes a GPU away from vLLM.
+nodeSelector:
+  workload: gpu-inference
+tolerations:
+  - key: nvidia.com/gpu
+    operator: Exists
+    effect: NoSchedule
+
+# The EKS NVIDIA AMI makes nvidia the default containerd runtime; this makes the runtime expose
+# every GPU on the node to the exporter.
+extraEnv:
+  - name: NVIDIA_VISIBLE_DEVICES
+    value: all
+
+# Small: it shares a 4-vCPU node with a vLLM pod that requests 2.5 vCPU (helm/vllm values).
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+
+serviceMonitor:
+  enabled: true
+  # Matches Prometheus' 15 s so GPU panels line up with vLLM's; DCGM samples every 30 s by
+  # default, so the extra scrapes just repeat the last value.
+  interval: 15s
+  scrapeTimeout: 10s
+  honorLabels: false
+  relabelings:
+    # The node the GPU is in, for joins with kube-state-metrics (instance type, node group).
+    - sourceLabels: [__meta_kubernetes_pod_node_name]
+      targetLabel: node
+      action: replace

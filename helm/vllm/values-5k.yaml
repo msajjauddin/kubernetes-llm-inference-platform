@@ -1,0 +1,68 @@
+# Production profile: 5,000 concurrent (in-flight) requests. Sizing and assumptions: docs/CAPACITY.md.
+# Use with terraform/5k.tfvars.example (g6e.xlarge GPU nodes, gpu_max_size 50):
+#   helm upgrade --install vllm helm/vllm -n llm -f helm/vllm/values-5k.yaml
+#
+# Per replica: 1 x NVIDIA L40S (48 GB). FP8 weights halve memory traffic per decode step, which is
+# what limits tokens/s at high batch sizes, and leave ~30 GB for KV cache (~500k tokens).
+
+model:
+  extraArgs:
+    # Weights quantized to FP8 at load time (Ada/L40S has FP8 tensor cores). Expect a small quality
+    # drop; check it on your own evals, or remove this and plan for roughly 1.6x the GPUs.
+    - --quantization
+    - fp8
+    # Hard cap on sequences decoded together. Past this, requests wait in vLLM's queue rather
+    # than slowing every running stream down beyond the 60 ms/token target.
+    - --max-num-seqs
+    - "192"
+  gpuMemoryUtilization: 0.92
+
+# g6e.xlarge: 4 vCPU, 32 GiB.
+resources:
+  requests:
+    cpu: "2500m"
+    memory: 16Gi
+    nvidia.com/gpu: 1
+  limits:
+    memory: 26Gi
+    nvidia.com/gpu: 1
+
+autoscaling:
+  # 2 so a node replacement or AZ issue never takes the model offline.
+  minReplicas: 2
+  # 50 x 100 in flight = 5,000. Keep equal to gpu_max_size in Terraform.
+  maxReplicas: 50
+  # Scale out at 100 in flight per GPU, about 80% of what one L40S holds within the latency
+  # targets (docs/CAPACITY.md). Each replica can still take up to 192 before requests queue.
+  targetInFlightPerReplica: 100
+  targetWaitingPerReplica: 8
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      # Whichever adds more: double the fleet, or 8 replicas, per minute. A new GPU replica takes
+      # minutes to become Ready (node boot, image pull, model load), so add capacity in big steps.
+      selectPolicy: Max
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+        - type: Pods
+          value: 8
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 600
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 300
+  # Pre-warm for the working day so the morning ramp doesn't wait on cold GPU nodes. KEDA takes the
+  # highest of all triggers, so the queue-depth triggers still scale above this. Adjust the
+  # timezone, hours and replicas to your traffic.
+  extraTriggers:
+    - type: cron
+      name: business-hours
+      metadata:
+        timezone: Etc/UTC
+        start: "0 7 * * 1-5"
+        end: "0 19 * * 1-5"
+        desiredReplicas: "20"
